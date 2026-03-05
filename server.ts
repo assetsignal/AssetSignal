@@ -1,0 +1,1864 @@
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import Database from "better-sqlite3";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+import { randomUUID } from "crypto";
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const localDbPath = path.join(__dirname, "assetsignal.db");
+const runtimeDbPath = process.env.VERCEL ? "/tmp/assetsignal.db" : localDbPath;
+
+if (process.env.VERCEL && !fs.existsSync(runtimeDbPath) && fs.existsSync(localDbPath)) {
+  fs.copyFileSync(localDbPath, runtimeDbPath);
+}
+
+const db = new Database(runtimeDbPath);
+db.pragma('foreign_keys = ON');
+
+// Initialize database
+db.exec(`
+  CREATE TABLE IF NOT EXISTS properties (
+    id TEXT PRIMARY KEY,
+    external_id TEXT,
+    name TEXT NOT NULL,
+    asset_type TEXT DEFAULT 'Student Housing',
+    total_beds INTEGER DEFAULT 0,
+    market TEXT,
+    target_occupancy REAL DEFAULT 0,
+    competitor_names TEXT, -- JSON array
+    competitor_urls TEXT, -- JSON object
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS monthly_records (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    month TEXT NOT NULL, -- YYYY-MM
+    revenue TEXT, -- JSON FinancialCategory
+    expenses TEXT, -- JSON FinancialCategory
+    occupancy REAL DEFAULT 0,
+    preleased_beds INTEGER DEFAULT 0,
+    uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS weekly_prelease (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    date TEXT NOT NULL, -- YYYY-MM-DD
+    beds_leased INTEGER DEFAULT 0,
+    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS comp_pricing (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_name TEXT,
+    floor_plan TEXT,
+    rent REAL,
+    date TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS weekly_prelease_snapshots (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    week_ending_date TEXT NOT NULL, -- YYYY-MM-DD (Monday)
+    total_beds INTEGER NOT NULL,
+    preleased_beds INTEGER NOT NULL,
+    prelease_pct REAL NOT NULL,
+    source_system TEXT NOT NULL,
+    source_ref TEXT,
+    data_quality TEXT NOT NULL DEFAULT 'valid',
+    note TEXT,
+    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE,
+    UNIQUE(property_id, week_ending_date)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_weekly_prelease_snapshots_property_week
+    ON weekly_prelease_snapshots(property_id, week_ending_date DESC);
+
+  CREATE TABLE IF NOT EXISTS weekly_prelease_audit (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    action TEXT NOT NULL, -- create|update|override
+    old_value TEXT,
+    new_value TEXT,
+    actor TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (snapshot_id) REFERENCES weekly_prelease_snapshots(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS concession_history (
+    id TEXT PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    snapshot_date TEXT NOT NULL, -- YYYY-MM-DD
+    promo_count INTEGER NOT NULL DEFAULT 0,
+    avg_rent REAL NOT NULL DEFAULT 0,
+    source_system TEXT NOT NULL DEFAULT 'market_scan',
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE,
+    UNIQUE(property_id, snapshot_date)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_concession_history_property_date
+    ON concession_history(property_id, snapshot_date ASC);
+`);
+
+// Migration: Ensure all columns exist in properties table
+try {
+  const tableInfo = db.prepare("PRAGMA table_info(properties)").all() as any[];
+  const columns = tableInfo.map(col => col.name);
+  
+  const requiredColumns = [
+    { name: 'external_id', type: "TEXT" },
+    { name: 'asset_type', type: "TEXT DEFAULT 'Student Housing'" },
+    { name: 'total_beds', type: "INTEGER DEFAULT 0" },
+    { name: 'target_occupancy', type: "REAL DEFAULT 0" },
+    { name: 'competitor_names', type: "TEXT" },
+    { name: 'competitor_urls', type: "TEXT" }
+  ];
+
+  for (const col of requiredColumns) {
+    if (!columns.includes(col.name)) {
+      db.exec(`ALTER TABLE properties ADD COLUMN ${col.name} ${col.type}`);
+      console.log(`Migration: Added ${col.name} column to properties table`);
+    }
+  }
+} catch (e) {
+  console.error("Migration error:", e);
+}
+
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+
+type OpenAIMessage = {
+  role: "system" | "user" | "assistant";
+  content: string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }>;
+};
+
+type FloorplanRange = { name: string; minRent: number; maxRent: number };
+
+async function callOpenAI(args: {
+  model?: string;
+  messages: OpenAIMessage[];
+  temperature?: number;
+  json?: boolean;
+}) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is missing. Add it to your .env file.");
+  }
+
+  const response = await fetch(OPENAI_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: args.model || process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      messages: args.messages,
+      temperature: typeof args.temperature === "number" ? args.temperature : 0.2,
+      ...(args.json ? { response_format: { type: "json_object" } } : {}),
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    const message = data?.error?.message || `OpenAI request failed (${response.status})`;
+    throw new Error(message);
+  }
+
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text || typeof text !== "string") {
+    throw new Error("OpenAI response did not include text content.");
+  }
+
+  return text;
+}
+
+function parseFirstMonth(text: string): string | null {
+  const ym = text.match(/\b(20\d{2})[-\/](0[1-9]|1[0-2])\b/);
+  if (ym) return `${ym[1]}-${ym[2]}`;
+
+  const monthName = text.match(
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\b[\s,]+(20\d{2})/i
+  );
+  if (!monthName) return null;
+
+  const names = [
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+  ];
+  const idx = names.indexOf(monthName[1].toLowerCase());
+  if (idx < 0) return null;
+  return `${monthName[2]}-${String(idx + 1).padStart(2, "0")}`;
+}
+
+function zeroCategory(name: string, accountCode: string) {
+  return {
+    name,
+    accountCode,
+    currentMonthActual: 0,
+    currentMonthBudget: 0,
+    actual: 0,
+    budget: 0,
+    subcategories: [],
+  };
+}
+
+function fallbackExtractFromCsv(csvText: string) {
+  const month = parseFirstMonth(csvText) || new Date().toISOString().slice(0, 7);
+
+  return {
+    reportingMonth: month,
+    occupancyStats: {
+      totalBeds: 0,
+      occupiedBeds: 0,
+      preleasedBeds: 0,
+      occupancyPct: 0,
+    },
+    revenue: {
+      rentalIncome: zeroCategory("Rental Income", "4000"),
+      otherIncome: zeroCategory("Other Income", "4100"),
+    },
+    expenses: {
+      payroll: zeroCategory("Payroll", "5000"),
+      repairsMaintenance: zeroCategory("Repairs & Maintenance", "5100"),
+      utilities: zeroCategory("Utilities", "5200"),
+      insurance: {
+        name: "Insurance",
+        accountCode: "5300",
+        currentMonthActual: 0,
+        currentMonthBudget: 0,
+        actual: 0,
+        budget: 0,
+      },
+      propertyManagement: {
+        name: "Property Management",
+        accountCode: "5400",
+        currentMonthActual: 0,
+        currentMonthBudget: 0,
+        actual: 0,
+        budget: 0,
+      },
+      taxes: zeroCategory("Taxes", "5500"),
+      marketing: zeroCategory("Marketing", "5600"),
+      admin: zeroCategory("Admin", "5700"),
+      otherOpEx: {
+        name: "Other OpEx",
+        accountCode: "5800",
+        currentMonthActual: 0,
+        currentMonthBudget: 0,
+        actual: 0,
+        budget: 0,
+      },
+    },
+    _fallbackUsed: true,
+    _fallbackReason: "OpenAI quota unavailable; returned template for manual review/edit.",
+  };
+}
+
+function normalizeUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractCandidatePageUrls(baseUrl: string, html: string): string[] {
+  const base = new URL(baseUrl);
+  const hrefs = Array.from(html.matchAll(/href\s*=\s*["']([^"'#]+)["']/gi))
+    .map((m) => m[1])
+    .filter(Boolean);
+  const srcs = Array.from(html.matchAll(/src\s*=\s*["']([^"'#]+)["']/gi))
+    .map((m) => m[1])
+    .filter(Boolean);
+  const matches = [...hrefs, ...srcs];
+
+  const allowPath = /(floor|plan|pricing|rate|availability|apartments|units?)/i;
+  const allowExternalHost = /(entrata|realpage|rentcafe|resman|funnel|knock|yardi|propertysite|livelovely|apartmentseo|securecafe|siteplan|guestcard|appfolio|highmarkres)/i;
+  const out = new Set<string>();
+
+  for (const href of matches) {
+    try {
+      const absolute = new URL(href, base).toString();
+      const parsed = new URL(absolute);
+      const sameOrigin = parsed.origin === base.origin;
+      const looksLikePricingHost = allowExternalHost.test(parsed.hostname);
+      const looksLikePricingPath = allowPath.test(parsed.pathname + parsed.search);
+      if (!sameOrigin && !looksLikePricingHost && !looksLikePricingPath) continue;
+      if (!looksLikePricingPath && !looksLikePricingHost) continue;
+      out.add(parsed.toString());
+    } catch {
+      // Ignore malformed URLs.
+    }
+  }
+
+  // Also scan absolute URLs embedded in scripts/json blobs.
+  const inlineAbs = Array.from(html.matchAll(/https?:\/\/[^\s"'<>]+/gi)).map((m) => m[0]);
+  for (const url of inlineAbs) {
+    try {
+      const parsed = new URL(url);
+      const sameOrigin = parsed.origin === base.origin;
+      const looksLikePricingHost = allowExternalHost.test(parsed.hostname);
+      const looksLikePricingPath = allowPath.test(parsed.pathname + parsed.search);
+      if (!sameOrigin && !looksLikePricingHost && !looksLikePricingPath) continue;
+      out.add(parsed.toString());
+    } catch {
+      // ignore
+    }
+  }
+
+  return Array.from(out).slice(0, 12);
+}
+
+function defaultPricingPages(baseUrl: string): string[] {
+  try {
+    const base = new URL(baseUrl);
+    return [
+      new URL("/availability", base).toString(),
+      new URL("/floorplans", base).toString(),
+      new URL("/floorplan", base).toString(),
+      new URL("/pricing", base).toString(),
+      new URL("/floor-plans", base).toString(),
+      new URL("/apply", base).toString(),
+    ];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchPageText(url: string): Promise<{ html: string; text: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  const response = await fetch(url, {
+    signal: controller.signal,
+    headers: { "User-Agent": "AssetSignalBot/1.0 (+https://localhost)" },
+  });
+  clearTimeout(timeout);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const html = await response.text();
+  if (/Just a moment|cf_chl|cdn-cgi\/challenge-platform|Enable JavaScript and cookies to continue/i.test(html)) {
+    throw new Error("BOT_BLOCKED_CLOUDFLARE");
+  }
+  return { html, text: stripHtmlToText(html) };
+}
+
+async function fetchPageTextWithBrowser(url: string): Promise<{ html: string; text: string } | null> {
+  try {
+    const loadPlaywright = new Function("return import('playwright')");
+    const playwright = await (loadPlaywright() as Promise<any>).catch(() => null);
+    if (!playwright?.chromium) return null;
+
+    const browser = await playwright.chromium.launch({ headless: true });
+    const page = await browser.newPage({
+      userAgent: "AssetSignalBot/1.0 (+https://localhost)",
+    });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(2000);
+    const html = await page.content();
+    if (/Just a moment|cf_chl|cdn-cgi\/challenge-platform|Enable JavaScript and cookies to continue/i.test(html)) {
+      await browser.close();
+      return null;
+    }
+    const text = await page.innerText("body").catch(() => stripHtmlToText(html));
+    await browser.close();
+    return { html, text: text || stripHtmlToText(html) };
+  } catch {
+    return null;
+  }
+}
+
+function matchCompetitorUrl(name: string, competitorUrls: Record<string, string>): string {
+  const exact = competitorUrls[name];
+  if (exact) return exact;
+  const normalized = name.trim().toLowerCase().replace(/\s+/g, " ");
+  const key = Object.keys(competitorUrls).find(
+    (k) => k.trim().toLowerCase().replace(/\s+/g, " ") === normalized
+  );
+  return key ? competitorUrls[key] : "";
+}
+
+function detectPromoFromWebsiteText(text: string) {
+  const hasPromoAnchor = (snippet: string) =>
+    /(\$\s?\d{2,5}|(?:\d{1,2}%\s*(?:off|discount))|free\s+(?:month|rent|weeks?)|waiv(?:ed|er)|concession|special|limited\s+time\s+offer|rates?\s+from\s+\$|starting\s+at\s+\$)/i.test(
+      snippet
+    );
+  const hasPromoLabel = (snippet: string) =>
+    /(special|offer|deal|concession|promotion|leasing\s+special)/i.test(snippet);
+  const hasCtaSignal = (snippet: string) =>
+    /(apply\s+now|lease\s+now|sign\s+now|book\s+a\s+tour|schedule\s+a\s+tour|now\s+leasing)/i.test(snippet);
+
+  const rules: Array<{ type: "Gift Card" | "Free Month" | "Fee Waiver" | "Price Drop" | "Urgency Marketing"; regex: RegExp }> = [
+    { type: "Gift Card", regex: /(gift\s*card|\$\s?\d{2,4}\s*gift\s*card)/i },
+    { type: "Free Month", regex: /(one\s+month\s+free|free\s+month|months?\s+free|free\s+rent)/i },
+    { type: "Fee Waiver", regex: /(fee\s+waiv(?:er|ed)|waived\s+(application|admin)\s+fee|no\s+(application|admin)\s+fee)/i },
+    { type: "Price Drop", regex: /(starting\s+at\s+\$\s?\d{3,4}|rates?\s+from\s+\$\s?\d{3,4}|reduced\s+rent|price\s+drop|special\s+rate)/i },
+    { type: "Urgency Marketing", regex: /(limited\s+time|ends\s+soon|hurry|act\s+now|last\s+chance|while\s+supplies\s+last)/i },
+  ];
+
+  for (const rule of rules) {
+    const match = text.match(rule.regex);
+    if (!match || typeof match.index !== "number") continue;
+
+    const start = Math.max(0, match.index - 80);
+    const end = Math.min(text.length, match.index + 160);
+    const snippet = text.slice(start, end).trim();
+    const longEnough = snippet.length >= 18;
+
+    // Tight gating to reduce false positives:
+    // 1) snippet must be substantive
+    // 2) urgency-only phrases must also include a concrete promo anchor
+    if (!longEnough) continue;
+    if (rule.type === "Urgency Marketing" && !hasPromoAnchor(snippet)) continue;
+
+    const confidence: "visible_banner" | "raw_text_match" =
+      hasPromoAnchor(snippet) && (hasPromoLabel(snippet) || hasCtaSignal(snippet))
+        ? "visible_banner"
+        : "raw_text_match";
+
+    return {
+      type: rule.type,
+      text: snippet.length > 12 ? snippet : match[0],
+      found: true,
+      confidence,
+      sourceSnippet: snippet,
+    };
+  }
+
+  return {
+    type: "Urgency Marketing" as const,
+    text: "",
+    found: false,
+    confidence: "raw_text_match" as const,
+    sourceSnippet: "",
+  };
+}
+
+function extractFloorplanRangesFromWebsiteText(text: string): FloorplanRange[] {
+  const ranges = new Map<string, FloorplanRange>();
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  const priceNum = (val: string) => Number((val || "").replace(/,/g, ""));
+
+  const addRange = (name: string, min: number, max?: number) => {
+    if (!name || !Number.isFinite(min)) return;
+    const normalizedName = name
+      .replace(/\b(starting at|from|only|now leasing)\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 48);
+    if (!normalizedName) return;
+
+    const nextMax = Number.isFinite(max as number) ? (max as number) : min;
+    const existing = ranges.get(normalizedName.toLowerCase());
+    if (!existing) {
+      ranges.set(normalizedName.toLowerCase(), {
+        name: normalizedName,
+        minRent: Math.min(min, nextMax),
+        maxRent: Math.max(min, nextMax),
+      });
+      return;
+    }
+    existing.minRent = Math.min(existing.minRent, min, nextMax);
+    existing.maxRent = Math.max(existing.maxRent, min, nextMax);
+  };
+
+  // Pattern: "<Floorplan> ... $1200 - $1450"
+  const rangeRegex = /([A-Za-z0-9][A-Za-z0-9\s\-\/]{1,40}?)\s*(?:from|starting at|rates? from)?\s*\$([0-9]{3,5}(?:,[0-9]{3})?)\s*(?:-|to)\s*\$([0-9]{3,5}(?:,[0-9]{3})?)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = rangeRegex.exec(cleaned)) !== null) {
+    const candidate = m[1].trim();
+    if (!/(studio|bed|bdrm|bedroom|plan|floor|layout|1x1|2x2|3x3|4x4)/i.test(candidate)) continue;
+    addRange(candidate, priceNum(m[2]), priceNum(m[3]));
+  }
+
+  // Pattern: "<Floorplan> ... from $1200"
+  const fromRegex = /([A-Za-z0-9][A-Za-z0-9\s\-\/]{1,40}?)\s*(?:from|starting at|rates? from)\s*\$([0-9]{3,5}(?:,[0-9]{3})?)/gi;
+  while ((m = fromRegex.exec(cleaned)) !== null) {
+    const candidate = m[1].trim();
+    if (!/(studio|bed|bdrm|bedroom|plan|floor|layout|1x1|2x2|3x3|4x4)/i.test(candidate)) continue;
+    addRange(candidate, priceNum(m[2]));
+  }
+
+  // Pattern: "<Floorplan> ... $1200" (no explicit "from")
+  const directPriceRegex = /([A-Za-z0-9][A-Za-z0-9\s\-\/]{1,60}?)\s+\$([0-9]{3,5}(?:,[0-9]{3})?)\b/gi;
+  while ((m = directPriceRegex.exec(cleaned)) !== null) {
+    const candidate = m[1].trim();
+    if (!/(studio|bed|bdrm|bedroom|plan|floor|layout|1x1|2x2|3x3|4x4|5x5|townhome|loft)/i.test(candidate)) continue;
+    if (/(sq\s*ft|square\s*feet|deposit|fee|parking|pet|application|admin)/i.test(candidate)) continue;
+    addRange(candidate, priceNum(m[2]));
+  }
+
+  // Pattern: "<Floorplan> ... $899/mo" or "$899 per month"
+  const monthlyRegex = /([A-Za-z0-9][A-Za-z0-9\s\-\/]{1,60}?)\s+\$([0-9]{3,5}(?:,[0-9]{3})?)\s*(?:\/\s*mo|per\s*month|monthly)/gi;
+  while ((m = monthlyRegex.exec(cleaned)) !== null) {
+    const candidate = m[1].trim();
+    if (!/(studio|bed|bdrm|bedroom|plan|floor|layout|1x1|2x2|3x3|4x4|5x5|townhome|loft)/i.test(candidate)) continue;
+    if (/(sq\s*ft|square\s*feet|deposit|fee|parking|pet|application|admin)/i.test(candidate)) continue;
+    addRange(candidate, priceNum(m[2]));
+  }
+
+  // Reverse pattern: "$899 ... 2x2" / "$899 Studio"
+  const reverseRegex = /\$([0-9]{3,5}(?:,[0-9]{3})?)\s*(?:\/\s*mo|per\s*month|monthly)?\s*(?:for|-|:)?\s*([A-Za-z0-9][A-Za-z0-9\s\-\/]{1,40}?(?:studio|bed|bdrm|bedroom|plan|floor|layout|1x1|2x2|3x3|4x4|5x5))/gi;
+  while ((m = reverseRegex.exec(cleaned)) !== null) {
+    const candidate = m[2].trim();
+    addRange(candidate, priceNum(m[1]));
+  }
+
+  const list = Array.from(ranges.values()).slice(0, 8);
+  if (list.length > 0) return list;
+
+  // Fallback: overall rent band from all currency values on page.
+  const allPrices = Array.from(cleaned.matchAll(/\$([0-9]{3,5}(?:,[0-9]{3})?)/g))
+    .map((v) => Number(v[1].replace(/,/g, "")))
+    .filter((n) => Number.isFinite(n) && n >= 300 && n <= 10000);
+  if (allPrices.length === 0) return [];
+
+  const min = Math.min(...allPrices);
+  const max = Math.max(...allPrices);
+  return [{ name: "All Floorplans", minRent: min, maxRent: max }];
+}
+
+function extractFloorplanRangesFromHtml(html: string): FloorplanRange[] {
+  const ranges = new Map<string, FloorplanRange>();
+  const cleaned = html.replace(/\s+/g, " ");
+  const priceNum = (val: string) => Number((val || "").replace(/,/g, ""));
+
+  const addRange = (name: string, min: number, max?: number) => {
+    if (!name || !Number.isFinite(min)) return;
+    const normalizedName = name.replace(/\s+/g, " ").trim().slice(0, 48);
+    if (!normalizedName) return;
+    const nextMax = Number.isFinite(max as number) ? (max as number) : min;
+    const key = normalizedName.toLowerCase();
+    const existing = ranges.get(key);
+    if (!existing) {
+      ranges.set(key, {
+        name: normalizedName,
+        minRent: Math.min(min, nextMax),
+        maxRent: Math.max(min, nextMax),
+      });
+      return;
+    }
+    existing.minRent = Math.min(existing.minRent, min, nextMax);
+    existing.maxRent = Math.max(existing.maxRent, min, nextMax);
+  };
+
+  const nameThenPrice =
+    /((?:studio|\d+\s*(?:bed|bedroom)|\d+x\d+|[A-Za-z0-9][A-Za-z0-9\s\-\/]{0,30}(?:plan|layout)))[^$]{0,90}\$([0-9]{3,5}(?:,[0-9]{3})?)(?:[^$]{0,30}\$([0-9]{3,5}(?:,[0-9]{3})?))?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = nameThenPrice.exec(cleaned)) !== null) {
+    addRange(m[1], priceNum(m[2]), m[3] ? priceNum(m[3]) : undefined);
+  }
+
+  const jsonPair =
+    /"(?:name|floorplan|unitType|unit_type|planName|plan_name)"\s*:\s*"([^"]{1,60})"[^{}]{0,260}?"(?:rent|price|minRent|maxRent|min_rent|max_rent|startingAt|starting_at)"\s*:\s*"?\$?([0-9]{3,5}(?:,[0-9]{3})?)"?/gi;
+  while ((m = jsonPair.exec(cleaned)) !== null) {
+    if (!/(studio|bed|bedroom|bdrm|1x1|2x2|3x3|4x4|plan|layout)/i.test(m[1])) continue;
+    addRange(m[1], priceNum(m[2]));
+  }
+
+  return Array.from(ranges.values()).slice(0, 10);
+}
+
+function mergeFloorplanRanges(textRanges: FloorplanRange[], htmlRanges: FloorplanRange[]) {
+  const merged = new Map<string, FloorplanRange>();
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+
+  for (const r of [...htmlRanges, ...textRanges]) {
+    const key = norm(r.name);
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, { ...r });
+      continue;
+    }
+    existing.minRent = Math.min(existing.minRent, r.minRent);
+    existing.maxRent = Math.max(existing.maxRent, r.maxRent);
+  }
+
+  return Array.from(merged.values()).slice(0, 10);
+}
+
+function formatRentRangeSummary(floorplanRanges: FloorplanRange[]) {
+  if (!floorplanRanges || floorplanRanges.length === 0) return "No floorplan rent range found on official website.";
+  return floorplanRanges
+    .map((r) =>
+      r.minRent === r.maxRent
+        ? `${r.name}: $${r.minRent.toLocaleString()}`
+        : `${r.name}: $${r.minRent.toLocaleString()}-$${r.maxRent.toLocaleString()}`
+    )
+    .join(" | ");
+}
+
+type WeeklyPreleaseRow = {
+  propertyExternalId?: string;
+  weekEndingDate?: string;
+  totalBeds?: number;
+  preleasedBeds?: number;
+};
+
+function parseISODate(dateStr: string): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const d = new Date(Date.UTC(year, month - 1, day));
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== month - 1 ||
+    d.getUTCDate() !== day
+  ) return null;
+  return d;
+}
+
+function toISODateUTC(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function normalizeToMondayISO(dateStr: string): string | null {
+  const date = parseISODate(dateStr);
+  if (!date) return null;
+  const day = date.getUTCDay(); // 0=Sun,1=Mon,...6=Sat
+  const deltaToMonday = day === 0 ? -6 : 1 - day;
+  date.setUTCDate(date.getUTCDate() + deltaToMonday);
+  return toISODateUTC(date);
+}
+
+function isMondayISO(dateStr: string): boolean {
+  const d = parseISODate(dateStr);
+  return !!d && d.getUTCDay() === 1;
+}
+
+function computeQualityFlag(args: {
+  totalBeds: number;
+  preleasedBeds: number;
+  previousPct: number | null;
+  currentPct: number;
+}): "valid" | "warning" | "error" {
+  if (args.totalBeds <= 0 || args.preleasedBeds < 0 || args.preleasedBeds > args.totalBeds) {
+    return "error";
+  }
+  if (args.previousPct != null && Math.abs(args.currentPct - args.previousPct) > 25) {
+    return "warning";
+  }
+  return "valid";
+}
+
+async function extractFloorplanRangesWithAI(input: {
+  competitorName: string;
+  sourceUrls: string[];
+  html: string;
+  text: string;
+}): Promise<FloorplanRange[]> {
+  try {
+    const modelInput = [
+      `Competitor: ${input.competitorName}`,
+      `Source URLs: ${input.sourceUrls.join(", ")}`,
+      "Task: Extract floorplan-level rent values explicitly present in the provided text/html.",
+      "Rules:",
+      "- Do not infer or guess missing values.",
+      "- Output JSON only: { floorplanRanges: [{ name, minRent, maxRent }] }",
+      "- If a floorplan has one numeric rent, set minRent=maxRent.",
+      "- If no explicit floorplan+rent evidence exists, return an empty array.",
+      "",
+      "HTML Snippet:",
+      input.html.slice(0, 120000),
+      "",
+      "Visible Text Snippet:",
+      input.text.slice(0, 80000),
+    ].join("\n");
+
+    const raw = await callOpenAI({
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: "You are a strict parser. Return only factual extracted JSON." },
+        { role: "user", content: modelInput },
+      ],
+      json: true,
+      temperature: 0,
+    });
+
+    const parsed = JSON.parse(raw);
+    const rows = Array.isArray(parsed?.floorplanRanges) ? parsed.floorplanRanges : [];
+    const out: FloorplanRange[] = [];
+    for (const r of rows) {
+      const name = typeof r?.name === "string" ? r.name.trim() : "";
+      const minRent = Number(r?.minRent);
+      const maxRent = Number(r?.maxRent);
+      if (!name || !Number.isFinite(minRent) || !Number.isFinite(maxRent)) continue;
+      if (minRent < 300 || maxRent > 10000) continue;
+      out.push({
+        name: name.slice(0, 48),
+        minRent: Math.min(minRent, maxRent),
+        maxRent: Math.max(minRent, maxRent),
+      });
+    }
+    return out.slice(0, 10);
+  } catch {
+    return [];
+  }
+}
+
+export async function createApp(options: { includeFrontend?: boolean } = {}) {
+  const app = express();
+  const includeFrontend = options.includeFrontend ?? false;
+
+  app.use(express.json({ limit: '50mb' }));
+
+  // API Routes
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok" });
+  });
+
+  app.post("/api/ai/extract", async (req, res) => {
+    try {
+      const { csvText, imageDataUrl, fileName } = req.body as {
+        csvText?: string;
+        imageDataUrl?: string;
+        fileName?: string;
+      };
+
+      const instruction =
+        "Extract the financial data, reporting month, and occupancy statistics from this file and return valid JSON only. " +
+        "Use this schema: { reportingMonth: 'YYYY-MM', occupancyStats: { totalBeds, occupiedBeds, preleasedBeds, occupancyPct }, " +
+        "revenue: { rentalIncome: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] }, " +
+        "otherIncome: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] } }, " +
+        "expenses: { payroll: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] }, " +
+        "repairsMaintenance: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] }, " +
+        "utilities: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] }, " +
+        "insurance: { currentMonthActual, currentMonthBudget, actual, budget }, propertyManagement: { currentMonthActual, currentMonthBudget, actual, budget }, " +
+        "taxes: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] }, " +
+        "marketing: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] }, " +
+        "admin: { currentMonthActual, currentMonthBudget, actual, budget, subcategories: [{accountCode, name, currentMonthActual, currentMonthBudget, actual, budget}] }, " +
+        "otherOpEx: { currentMonthActual, currentMonthBudget, actual, budget } } }. " +
+        "All numeric fields must be numbers (not strings). If missing, use 0. If month is unknown, reportingMonth should be null.";
+
+      let messages: OpenAIMessage[] = [];
+      if (csvText && typeof csvText === "string") {
+        messages = [
+          { role: "system", content: "You extract real-estate P&L data into strict JSON." },
+          { role: "user", content: `${instruction}\n\nFile: ${fileName || "unknown"}\n\nCSV Data:\n${csvText}` },
+        ];
+      } else if (imageDataUrl && typeof imageDataUrl === "string" && imageDataUrl.startsWith("data:image")) {
+        messages = [
+          { role: "system", content: "You extract real-estate P&L data from document images into strict JSON." },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: instruction },
+              { type: "image_url", image_url: { url: imageDataUrl } },
+            ],
+          },
+        ];
+      } else {
+        return res.status(400).json({
+          error: "Unsupported file payload",
+          message: "Send either csvText or imageDataUrl (data:image/*).",
+        });
+      }
+
+      try {
+        const text = await callOpenAI({ messages, json: true });
+        const parsed = JSON.parse(text);
+        return res.json(parsed);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const isQuota =
+          message.includes("insufficient_quota") ||
+          message.includes("429") ||
+          message.toLowerCase().includes("quota");
+        if (isQuota && csvText) {
+          return res.json(fallbackExtractFromCsv(csvText));
+        }
+        throw err;
+      }
+    } catch (error) {
+      console.error("AI extract error:", error);
+      res.status(500).json({ error: "AI extraction failed", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/ai/analyze", async (req, res) => {
+    try {
+      const { prompt } = req.body as { prompt?: string };
+      if (!prompt) {
+        return res.status(400).json({ error: "Missing prompt" });
+      }
+
+      const text = await callOpenAI({
+        messages: [
+          { role: "system", content: "You are Asset Signal's analysis engine. Return strict JSON only." },
+          { role: "user", content: prompt },
+        ],
+        json: true,
+      });
+      const parsed = JSON.parse(text);
+      res.json(parsed);
+    } catch (error) {
+      console.error("AI analysis error:", error);
+      res.status(500).json({ error: "AI analysis failed", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/ai/chat", async (req, res) => {
+    try {
+      const { systemInstruction, message, history, context } = req.body as {
+        systemInstruction?: string;
+        message?: string;
+        history?: Array<{ role: "user" | "model"; text: string }>;
+        context?: string;
+      };
+      if (!message) {
+        return res.status(400).json({ error: "Missing message" });
+      }
+
+      const mappedHistory: OpenAIMessage[] = (history || [])
+        .slice(-8)
+        .map((m) => ({
+          role: m.role === "model" ? "assistant" : "user",
+          content: m.text,
+        }));
+
+      const messages: OpenAIMessage[] = [
+        {
+          role: "system",
+          content:
+            systemInstruction ||
+            "You are the Asset Signal assistant. Keep responses concise, accurate, and action-oriented.",
+        },
+        ...mappedHistory,
+        {
+          role: "user",
+          content: context ? `${message}\n\nContext:\n${context}` : message,
+        },
+      ];
+
+      const text = await callOpenAI({ messages, json: false });
+      res.json({ text });
+    } catch (error) {
+      console.error("AI chat error:", error);
+      res.status(500).json({ error: "AI chat failed", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/comp-scan", async (req, res) => {
+    try {
+      const {
+        competitorNames,
+        competitorUrls,
+      } = req.body as {
+        competitorNames?: string[];
+        competitorUrls?: Record<string, string>;
+      };
+
+      const names = (competitorNames || []).map((n) => (n || "").trim()).filter(Boolean);
+      const urls = competitorUrls || {};
+      const today = new Date().toISOString().split("T")[0];
+
+      const compIntelligence: any[] = [];
+      const activePromos: any[] = [];
+
+      for (let i = 0; i < names.length; i++) {
+        const name = names[i];
+        const rawUrl = matchCompetitorUrl(name, urls);
+        const siteUrl = normalizeUrl(rawUrl);
+        const competitorId = `comp-${i + 1}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+
+        if (!siteUrl) {
+          const floorplanRanges: any[] = [];
+          compIntelligence.push({
+            id: competitorId,
+            name,
+            url: "",
+            currentPromo: "No official competitor URL configured.",
+            promoType: "Unknown",
+            lastChangeDate: today,
+            avgRent: 0,
+            rentTrend: 0,
+            isAlert: false,
+            rentRangeSummary: "No official competitor URL configured.",
+            floorplanRanges,
+          });
+          continue;
+        }
+
+        try {
+          const seedPages = Array.from(new Set([siteUrl, ...defaultPricingPages(siteUrl)]));
+          const queue = [...seedPages];
+          const seen = new Set<string>();
+          let combinedText = "";
+          let combinedHtml = "";
+
+          while (queue.length > 0 && seen.size < 8) {
+            const pageUrl = queue.shift()!;
+            if (seen.has(pageUrl)) continue;
+            seen.add(pageUrl);
+            try {
+              const page = await fetchPageText(pageUrl);
+              combinedHtml += ` ${page.html}`;
+              combinedText += ` ${page.text}`;
+
+              const candidates = extractCandidatePageUrls(siteUrl, page.html);
+              for (const c of candidates) {
+                if (!seen.has(c) && queue.length < 10) queue.push(c);
+              }
+            } catch {
+              // Ignore page-level fetch failures and continue.
+            }
+          }
+
+          const promo = detectPromoFromWebsiteText(combinedText);
+          let floorplanRanges = mergeFloorplanRanges(
+            extractFloorplanRangesFromWebsiteText(combinedText),
+            extractFloorplanRangesFromHtml(combinedHtml)
+          );
+
+          // JS-rendered pricing pages (common for availability widgets).
+          if (floorplanRanges.length === 0 && process.env.ENABLE_BROWSER_SCRAPE !== "false") {
+            for (const pageUrl of Array.from(seen).slice(0, 4)) {
+              const browserPage = await fetchPageTextWithBrowser(pageUrl);
+              if (!browserPage) continue;
+              floorplanRanges = mergeFloorplanRanges(
+                floorplanRanges,
+                mergeFloorplanRanges(
+                  extractFloorplanRangesFromWebsiteText(browserPage.text),
+                  extractFloorplanRangesFromHtml(browserPage.html)
+                )
+              );
+              if (floorplanRanges.length > 0) break;
+            }
+          }
+
+          if (floorplanRanges.length === 0) {
+            const aiRanges = await extractFloorplanRangesWithAI({
+              competitorName: name,
+              sourceUrls: Array.from(seen),
+              html: combinedHtml,
+              text: combinedText,
+            });
+            floorplanRanges = mergeFloorplanRanges(floorplanRanges, aiRanges);
+          }
+          const rentRangeSummary = formatRentRangeSummary(floorplanRanges);
+
+          if (promo.found && promo.confidence === "visible_banner") {
+            activePromos.push({
+              id: `promo-${Date.now()}-${i}`,
+              competitorId,
+              competitorName: name,
+              url: siteUrl,
+              sourceUrl: siteUrl,
+              sourceSnippet: promo.sourceSnippet,
+              confidence: promo.confidence,
+              type: promo.type,
+              text: promo.text,
+              detectedDate: today,
+              status: "active",
+            });
+          }
+
+          compIntelligence.push({
+            id: competitorId,
+            name,
+            url: siteUrl,
+            currentPromo:
+              promo.found && promo.confidence === "visible_banner"
+                ? promo.text
+                : "No high-confidence promo detected on official website.",
+            promoType: promo.found && promo.confidence === "visible_banner" ? promo.type : "None",
+            lastChangeDate: today,
+            avgRent: 0,
+            rentTrend: 0,
+            isAlert: promo.found && promo.confidence === "visible_banner",
+            rentRangeSummary,
+            floorplanRanges,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const blocked = message.includes("BOT_BLOCKED_CLOUDFLARE");
+          compIntelligence.push({
+            id: competitorId,
+            name,
+            url: siteUrl,
+            currentPromo: blocked
+              ? "Pricing feed is protected by anti-bot (Cloudflare) and could not be fetched server-side."
+              : "Official site unreachable during scan.",
+            promoType: "Unknown",
+            lastChangeDate: today,
+            avgRent: 0,
+            rentTrend: 0,
+            isAlert: false,
+            rentRangeSummary: blocked
+              ? "Unable to extract floorplan rents: source feed blocked by anti-bot on provider iframe."
+              : "Official site unreachable during scan.",
+            floorplanRanges: [],
+          });
+        }
+      }
+
+      res.json({ compIntelligence, activePromos, scannedAt: new Date().toISOString() });
+    } catch (error) {
+      console.error("Comp scan error:", error);
+      res.status(500).json({ error: "Comp scan failed", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // Properties
+  app.get("/api/properties", (req, res) => {
+    const properties = db.prepare("SELECT * FROM properties ORDER BY name ASC").all();
+    res.json(properties.map((p: any) => ({
+      ...p,
+      competitorNames: JSON.parse(p.competitor_names || '[]'),
+      competitorUrls: JSON.parse(p.competitor_urls || '{}'),
+      assetType: p.asset_type,
+      totalBeds: p.total_beds,
+      targetOccupancy: p.target_occupancy,
+      externalId: p.external_id,
+      createdAt: p.created_at
+    })));
+  });
+
+  app.post("/api/properties", (req, res) => {
+    const { id, externalId, name, assetType, totalBeds, market, targetOccupancy, competitorNames, competitorUrls } = req.body;
+    db.prepare(`
+      INSERT INTO properties (id, external_id, name, asset_type, total_beds, market, target_occupancy, competitor_names, competitor_urls)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, externalId || null, name, assetType, totalBeds, market, targetOccupancy, JSON.stringify(competitorNames), JSON.stringify(competitorUrls || {}));
+    res.json({ success: true });
+  });
+
+  app.put("/api/properties/:id", (req, res) => {
+    const { externalId, name, totalBeds, market, targetOccupancy, competitorNames, competitorUrls } = req.body;
+    db.prepare(`
+      UPDATE properties 
+      SET external_id = ?, name = ?, total_beds = ?, market = ?, target_occupancy = ?, competitor_names = ?, competitor_urls = ?
+      WHERE id = ?
+    `).run(externalId || null, name, totalBeds, market, targetOccupancy, JSON.stringify(competitorNames), JSON.stringify(competitorUrls || {}), req.params.id);
+    res.json({ success: true });
+  });
+
+  // Monthly Records
+  app.get("/api/properties/:id/records", (req, res) => {
+    const records = db.prepare("SELECT * FROM monthly_records WHERE property_id = ? ORDER BY month DESC").all(req.params.id);
+    res.json(records.map((r: any) => ({
+      ...r,
+      propertyId: r.property_id,
+      revenue: JSON.parse(r.revenue),
+      expenses: JSON.parse(r.expenses),
+      uploadedAt: r.uploaded_at
+    })));
+  });
+
+  app.post("/api/properties/:id/records", (req, res) => {
+    const { id, month, revenue, expenses, occupancy, preleasedBeds } = req.body;
+    
+    // Ensure property exists
+    const property = db.prepare("SELECT id FROM properties WHERE id = ?").get(req.params.id);
+    if (!property) {
+      return res.status(404).json({ error: "Property not found" });
+    }
+
+    // Check if record for this month already exists
+    const existing = db.prepare("SELECT id FROM monthly_records WHERE property_id = ? AND month = ?").get(req.params.id, month) as any;
+    
+    if (existing) {
+      db.prepare(`
+        UPDATE monthly_records 
+        SET revenue = ?, expenses = ?, occupancy = ?, preleased_beds = ?, uploaded_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(JSON.stringify(revenue), JSON.stringify(expenses), occupancy, preleasedBeds, existing.id);
+    } else {
+      db.prepare(`
+        INSERT INTO monthly_records (id, property_id, month, revenue, expenses, occupancy, preleased_beds)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(id, req.params.id, month, JSON.stringify(revenue), JSON.stringify(expenses), occupancy, preleasedBeds);
+    }
+    res.json({ success: true });
+  });
+
+  // Weekly Prelease Data
+  app.get("/api/properties/:id/weekly-prelease", (req, res) => {
+    const snapshotData = db.prepare(`
+      SELECT id, property_id, week_ending_date, preleased_beds, total_beds, prelease_pct, source_system, data_quality, ingested_at
+      FROM weekly_prelease_snapshots
+      WHERE property_id = ?
+      ORDER BY week_ending_date ASC
+    `).all(req.params.id) as any[];
+
+    if (snapshotData.length > 0) {
+      return res.json(snapshotData.map((d: any) => ({
+        id: d.id,
+        propertyId: d.property_id,
+        date: d.week_ending_date,
+        bedsLeased: d.preleased_beds,
+        totalBeds: d.total_beds,
+        preleasePct: d.prelease_pct,
+        sourceSystem: d.source_system,
+        dataQuality: d.data_quality,
+        ingestedAt: d.ingested_at
+      })));
+    }
+
+    // Backward compatibility fallback for legacy rows.
+    const legacyData = db.prepare("SELECT * FROM weekly_prelease WHERE property_id = ? ORDER BY date ASC").all(req.params.id);
+    return res.json(legacyData.map((d: any) => ({
+      ...d,
+      propertyId: d.property_id,
+      bedsLeased: d.beds_leased
+    })));
+  });
+
+  app.post("/api/properties/:id/weekly-prelease", (req, res) => {
+    const { id, date, bedsLeased } = req.body;
+    const dateStr = String(date || "");
+    
+    // Ensure property exists
+    const property = db.prepare("SELECT id, total_beds FROM properties WHERE id = ?").get(req.params.id);
+    if (!property) {
+      return res.status(404).json({ error: "Property not found" });
+    }
+
+    const weekEndingDate = normalizeToMondayISO(dateStr);
+    if (!weekEndingDate) {
+      return res.status(400).json({ error: "Invalid date", message: "date must be YYYY-MM-DD" });
+    }
+
+    const totalBeds = Number((property as any).total_beds || 0);
+    const preleasedBeds = Number(bedsLeased || 0);
+    const preleasePct = totalBeds > 0 ? (preleasedBeds / totalBeds) * 100 : 0;
+
+    const prior = db.prepare(`
+      SELECT prelease_pct FROM weekly_prelease_snapshots
+      WHERE property_id = ? AND week_ending_date < ?
+      ORDER BY week_ending_date DESC
+      LIMIT 1
+    `).get(req.params.id, weekEndingDate) as any;
+
+    const dataQuality = computeQualityFlag({
+      totalBeds,
+      preleasedBeds,
+      previousPct: prior ? Number(prior.prelease_pct) : null,
+      currentPct: preleasePct
+    });
+
+    const existingSnapshot = db.prepare(`
+      SELECT id, total_beds, preleased_beds, prelease_pct, source_system, data_quality
+      FROM weekly_prelease_snapshots
+      WHERE property_id = ? AND week_ending_date = ?
+    `).get(req.params.id, weekEndingDate) as any;
+
+    const snapshotId = existingSnapshot?.id || id || randomUUID();
+    const nextSnapshot = {
+      id: snapshotId,
+      property_id: req.params.id,
+      week_ending_date: weekEndingDate,
+      total_beds: totalBeds,
+      preleased_beds: preleasedBeds,
+      prelease_pct: preleasePct,
+      source_system: "manual",
+      source_ref: "ui",
+      data_quality: dataQuality,
+      note: isMondayISO(dateStr) ? null : `Normalized from ${dateStr} to ${weekEndingDate}`,
+    };
+
+    if (existingSnapshot) {
+      db.prepare(`
+        UPDATE weekly_prelease_snapshots
+        SET total_beds = ?, preleased_beds = ?, prelease_pct = ?, source_system = ?, source_ref = ?, data_quality = ?, note = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(
+        nextSnapshot.total_beds,
+        nextSnapshot.preleased_beds,
+        nextSnapshot.prelease_pct,
+        nextSnapshot.source_system,
+        nextSnapshot.source_ref,
+        nextSnapshot.data_quality,
+        nextSnapshot.note,
+        snapshotId
+      );
+
+      db.prepare(`
+        INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+        VALUES (?, ?, 'update', ?, ?, 'ui-user', ?)
+      `).run(
+        randomUUID(),
+        snapshotId,
+        JSON.stringify(existingSnapshot),
+        JSON.stringify(nextSnapshot),
+        "manual weekly prelease update"
+      );
+    } else {
+      db.prepare(`
+        INSERT INTO weekly_prelease_snapshots (
+          id, property_id, week_ending_date, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        nextSnapshot.id,
+        nextSnapshot.property_id,
+        nextSnapshot.week_ending_date,
+        nextSnapshot.total_beds,
+        nextSnapshot.preleased_beds,
+        nextSnapshot.prelease_pct,
+        nextSnapshot.source_system,
+        nextSnapshot.source_ref,
+        nextSnapshot.data_quality,
+        nextSnapshot.note
+      );
+
+      db.prepare(`
+        INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+        VALUES (?, ?, 'create', NULL, ?, 'ui-user', ?)
+      `).run(
+        randomUUID(),
+        snapshotId,
+        JSON.stringify(nextSnapshot),
+        "manual weekly prelease create"
+      );
+    }
+
+    // Legacy table sync for backward compatibility.
+    const existing = db.prepare("SELECT id FROM weekly_prelease WHERE property_id = ? AND date = ?").get(req.params.id, weekEndingDate) as any;
+    
+    if (existing) {
+      db.prepare("UPDATE weekly_prelease SET beds_leased = ? WHERE id = ?").run(preleasedBeds, existing.id);
+    } else {
+      db.prepare("INSERT INTO weekly_prelease (id, property_id, date, beds_leased) VALUES (?, ?, ?, ?)").run(snapshotId, req.params.id, weekEndingDate, preleasedBeds);
+    }
+    return res.json({
+      success: true,
+      weekEndingDate,
+      normalizedDate: weekEndingDate !== dateStr,
+      dataQuality
+    });
+  });
+
+  app.post("/api/ingest/weekly-prelease", (req, res) => {
+    const { sourceSystem, runId, rows } = req.body as {
+      sourceSystem?: string;
+      runId?: string;
+      rows?: WeeklyPreleaseRow[];
+    };
+
+    if (!sourceSystem || !Array.isArray(rows)) {
+      return res.status(400).json({
+        error: "Invalid payload",
+        message: "sourceSystem and rows[] are required"
+      });
+    }
+
+    const inserted: any[] = [];
+    const updated: any[] = [];
+    const rejected: any[] = [];
+    const warnings: any[] = [];
+
+    const transaction = db.transaction(() => {
+      for (const row of rows) {
+        const external = String(row.propertyExternalId || "").trim();
+        const weekRaw = String(row.weekEndingDate || "").trim();
+        const normalizedWeek = normalizeToMondayISO(weekRaw);
+        const inputTotalBeds = Number(row.totalBeds);
+        const inputPreleasedBeds = Number(row.preleasedBeds);
+
+        if (!external) {
+          rejected.push({ row, reason: "propertyExternalId is required" });
+          continue;
+        }
+        if (!normalizedWeek) {
+          rejected.push({ row, reason: "weekEndingDate must be YYYY-MM-DD" });
+          continue;
+        }
+        if (!Number.isFinite(inputPreleasedBeds) || inputPreleasedBeds < 0) {
+          rejected.push({ row, reason: "preleasedBeds must be a non-negative number" });
+          continue;
+        }
+
+        const property = db.prepare(`
+          SELECT id, total_beds, external_id, name
+          FROM properties
+          WHERE id = ? OR external_id = ? OR lower(name) = lower(?)
+          LIMIT 1
+        `).get(external, external, external) as any;
+
+        if (!property) {
+          rejected.push({ row, reason: `Property not mapped for '${external}'` });
+          continue;
+        }
+
+        const totalBeds = Number.isFinite(inputTotalBeds) && inputTotalBeds > 0
+          ? inputTotalBeds
+          : Number(property.total_beds || 0);
+        const preleasedBeds = inputPreleasedBeds;
+        const preleasePct = totalBeds > 0 ? (preleasedBeds / totalBeds) * 100 : 0;
+
+        const prior = db.prepare(`
+          SELECT prelease_pct FROM weekly_prelease_snapshots
+          WHERE property_id = ? AND week_ending_date < ?
+          ORDER BY week_ending_date DESC
+          LIMIT 1
+        `).get(property.id, normalizedWeek) as any;
+
+        const dataQuality = computeQualityFlag({
+          totalBeds,
+          preleasedBeds,
+          previousPct: prior ? Number(prior.prelease_pct) : null,
+          currentPct: preleasePct
+        });
+
+        if (dataQuality === "error") {
+          rejected.push({ row, reason: "Validation failed (beds/prelease out of bounds)" });
+          continue;
+        }
+
+        if (!isMondayISO(weekRaw)) {
+          warnings.push({ row, reason: `weekEndingDate normalized to Monday ${normalizedWeek}` });
+        }
+        if (dataQuality === "warning") {
+          warnings.push({ row, reason: "Large week-over-week prelease change detected" });
+        }
+
+        const existing = db.prepare(`
+          SELECT id, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+          FROM weekly_prelease_snapshots
+          WHERE property_id = ? AND week_ending_date = ?
+        `).get(property.id, normalizedWeek) as any;
+
+        const snapshotId = existing?.id || randomUUID();
+        const nextSnapshot = {
+          id: snapshotId,
+          property_id: property.id,
+          week_ending_date: normalizedWeek,
+          total_beds: totalBeds,
+          preleased_beds: preleasedBeds,
+          prelease_pct: preleasePct,
+          source_system: sourceSystem,
+          source_ref: runId || null,
+          data_quality: dataQuality,
+          note: !isMondayISO(weekRaw) ? `Normalized from ${weekRaw} to ${normalizedWeek}` : null,
+        };
+
+        if (existing) {
+          db.prepare(`
+            UPDATE weekly_prelease_snapshots
+            SET total_beds = ?, preleased_beds = ?, prelease_pct = ?, source_system = ?, source_ref = ?, data_quality = ?, note = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `).run(
+            nextSnapshot.total_beds,
+            nextSnapshot.preleased_beds,
+            nextSnapshot.prelease_pct,
+            nextSnapshot.source_system,
+            nextSnapshot.source_ref,
+            nextSnapshot.data_quality,
+            nextSnapshot.note,
+            snapshotId
+          );
+
+          db.prepare(`
+            INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+            VALUES (?, ?, 'update', ?, ?, 'system', ?)
+          `).run(
+            randomUUID(),
+            snapshotId,
+            JSON.stringify(existing),
+            JSON.stringify(nextSnapshot),
+            runId ? `ingest run ${runId}` : "scheduled ingestion"
+          );
+
+          updated.push({ propertyId: property.id, weekEndingDate: normalizedWeek });
+        } else {
+          db.prepare(`
+            INSERT INTO weekly_prelease_snapshots (
+              id, property_id, week_ending_date, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            nextSnapshot.id,
+            nextSnapshot.property_id,
+            nextSnapshot.week_ending_date,
+            nextSnapshot.total_beds,
+            nextSnapshot.preleased_beds,
+            nextSnapshot.prelease_pct,
+            nextSnapshot.source_system,
+            nextSnapshot.source_ref,
+            nextSnapshot.data_quality,
+            nextSnapshot.note
+          );
+
+          db.prepare(`
+            INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+            VALUES (?, ?, 'create', NULL, ?, 'system', ?)
+          `).run(
+            randomUUID(),
+            snapshotId,
+            JSON.stringify(nextSnapshot),
+            runId ? `ingest run ${runId}` : "scheduled ingestion"
+          );
+
+          inserted.push({ propertyId: property.id, weekEndingDate: normalizedWeek });
+        }
+
+        // Legacy compatibility write-through.
+        const legacy = db.prepare(`
+          SELECT id FROM weekly_prelease WHERE property_id = ? AND date = ?
+        `).get(property.id, normalizedWeek) as any;
+        if (legacy) {
+          db.prepare("UPDATE weekly_prelease SET beds_leased = ? WHERE id = ?")
+            .run(preleasedBeds, legacy.id);
+        } else {
+          db.prepare(`
+            INSERT INTO weekly_prelease (id, property_id, date, beds_leased)
+            VALUES (?, ?, ?, ?)
+          `).run(snapshotId, property.id, normalizedWeek, preleasedBeds);
+        }
+      }
+    });
+
+    try {
+      transaction();
+      return res.json({
+        inserted: inserted.length,
+        updated: updated.length,
+        rejected: rejected.length,
+        warnings: warnings.length,
+        insertedRows: inserted,
+        updatedRows: updated,
+        rejectedRows: rejected,
+        warningRows: warnings
+      });
+    } catch (error) {
+      console.error("Weekly ingest error:", error);
+      return res.status(500).json({
+        error: "Weekly prelease ingestion failed",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  app.get("/api/weekly-prelease/audit/:propertyId", (req, res) => {
+    try {
+      const propertyId = req.params.propertyId;
+      const limitRaw = Number(req.query.limit);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 500) : 100;
+
+      const property = db.prepare(`
+        SELECT id, name, external_id
+        FROM properties
+        WHERE id = ? OR external_id = ? OR lower(name) = lower(?)
+        LIMIT 1
+      `).get(propertyId, propertyId, propertyId) as any;
+
+      if (!property) {
+        return res.status(404).json({
+          error: "Property not found",
+          message: `No property matched '${propertyId}'`
+        });
+      }
+
+      const rows = db.prepare(`
+        SELECT
+          a.id,
+          a.snapshot_id,
+          a.action,
+          a.old_value,
+          a.new_value,
+          a.actor,
+          a.reason,
+          a.created_at,
+          s.week_ending_date,
+          s.data_quality,
+          s.source_system
+        FROM weekly_prelease_audit a
+        JOIN weekly_prelease_snapshots s ON s.id = a.snapshot_id
+        WHERE s.property_id = ?
+        ORDER BY a.created_at DESC
+        LIMIT ?
+      `).all(property.id, limit) as any[];
+
+      return res.json({
+        property: {
+          id: property.id,
+          name: property.name,
+          externalId: property.external_id || null
+        },
+        count: rows.length,
+        rows: rows.map((r) => ({
+          id: r.id,
+          snapshotId: r.snapshot_id,
+          action: r.action,
+          oldValue: r.old_value ? JSON.parse(r.old_value) : null,
+          newValue: r.new_value ? JSON.parse(r.new_value) : null,
+          actor: r.actor,
+          reason: r.reason,
+          createdAt: r.created_at,
+          weekEndingDate: r.week_ending_date,
+          dataQuality: r.data_quality,
+          sourceSystem: r.source_system
+        }))
+      });
+    } catch (error) {
+      console.error("Weekly audit fetch error:", error);
+      return res.status(500).json({
+        error: "Failed to fetch weekly prelease audit",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  app.get("/api/properties/:id/concession-history", (req, res) => {
+    try {
+      const propertyId = req.params.id;
+      const rows = db.prepare(`
+        SELECT snapshot_date, promo_count, avg_rent, source_system, created_at, updated_at
+        FROM concession_history
+        WHERE property_id = ?
+        ORDER BY snapshot_date ASC
+      `).all(propertyId) as any[];
+
+      return res.json(rows.map((r) => ({
+        date: r.snapshot_date,
+        promoCount: Number(r.promo_count || 0),
+        avgRent: Number(r.avg_rent || 0),
+        sourceSystem: r.source_system,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at
+      })));
+    } catch (error) {
+      console.error("Concession history fetch error:", error);
+      return res.status(500).json({
+        error: "Failed to fetch concession history",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  app.post("/api/properties/:id/concession-history", (req, res) => {
+    try {
+      const propertyId = req.params.id;
+      const {
+        date,
+        promoCount,
+        avgRent,
+        sourceSystem,
+        notes
+      } = req.body as {
+        date?: string;
+        promoCount?: number;
+        avgRent?: number;
+        sourceSystem?: string;
+        notes?: string;
+      };
+
+      const snapshotDate = String(date || "").trim();
+      if (!parseISODate(snapshotDate)) {
+        return res.status(400).json({
+          error: "Invalid date",
+          message: "date must be YYYY-MM-DD"
+        });
+      }
+
+      const count = Number(promoCount);
+      if (!Number.isFinite(count) || count < 0) {
+        return res.status(400).json({
+          error: "Invalid promoCount",
+          message: "promoCount must be a non-negative number"
+        });
+      }
+
+      const avg = Number.isFinite(Number(avgRent)) ? Number(avgRent) : 0;
+      const id = randomUUID();
+      const source = String(sourceSystem || "market_scan").slice(0, 64);
+      const note = typeof notes === "string" ? notes.slice(0, 2000) : null;
+
+      db.prepare(`
+        INSERT INTO concession_history (
+          id, property_id, snapshot_date, promo_count, avg_rent, source_system, notes
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(property_id, snapshot_date) DO UPDATE SET
+          promo_count = excluded.promo_count,
+          avg_rent = excluded.avg_rent,
+          source_system = excluded.source_system,
+          notes = excluded.notes,
+          updated_at = CURRENT_TIMESTAMP
+      `).run(id, propertyId, snapshotDate, count, avg, source, note);
+
+      const row = db.prepare(`
+        SELECT snapshot_date, promo_count, avg_rent, source_system, created_at, updated_at
+        FROM concession_history
+        WHERE property_id = ? AND snapshot_date = ?
+      `).get(propertyId, snapshotDate) as any;
+
+      return res.json({
+        date: row.snapshot_date,
+        promoCount: Number(row.promo_count || 0),
+        avgRent: Number(row.avg_rent || 0),
+        sourceSystem: row.source_system,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      });
+    } catch (error) {
+      console.error("Concession history upsert error:", error);
+      return res.status(500).json({
+        error: "Failed to save concession history",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  // Portfolio Aggregation
+  app.get("/api/portfolio", (req, res) => {
+    // Get all properties and their latest record if it exists
+    const properties = db.prepare("SELECT * FROM properties ORDER BY name ASC").all();
+    
+    const portfolio = properties.map((p: any) => {
+      const latestRecord = db.prepare(`
+        SELECT * FROM monthly_records 
+        WHERE property_id = ? 
+        ORDER BY month DESC 
+        LIMIT 1
+      `).get(p.id) as any;
+
+      if (!latestRecord) {
+        return {
+          propertyId: p.id,
+          propertyName: p.name,
+          month: 'No Data',
+          revenue: 0,
+          noi: 0,
+          occupancy: 0,
+          momNoiChange: 0,
+          riskFlag: false,
+          noData: true
+        };
+      }
+
+      const revenue = JSON.parse(latestRecord.revenue || '{}');
+      const expenses = JSON.parse(latestRecord.expenses || '{}');
+      
+      const getVal = (cat: any) => {
+        if (!cat) return 0;
+        if (cat.subcategories && Array.isArray(cat.subcategories)) {
+          return cat.subcategories.reduce((sum: number, sub: any) => sum + (Number(sub.actual) || 0), 0);
+        }
+        return Number(cat.actual) || 0;
+      };
+
+      const totalRev = Number(Object.values(revenue).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+      const totalExp = Number(Object.values(expenses).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+      const noi = totalRev - totalExp;
+
+      // Find prior month for MoM change
+      const [year, month] = latestRecord.month.split('-').map(Number);
+      const priorMonthDate = new Date(year, month - 2, 1);
+      const priorMonthStr = `${priorMonthDate.getFullYear()}-${String(priorMonthDate.getMonth() + 1).padStart(2, '0')}`;
+      
+      const priorRecord = db.prepare("SELECT * FROM monthly_records WHERE property_id = ? AND month = ?")
+        .get(p.id, priorMonthStr) as any;
+
+      let momNoiChange = 0;
+      if (priorRecord) {
+        const pRev = JSON.parse(priorRecord.revenue || '{}');
+        const pExp = JSON.parse(priorRecord.expenses || '{}');
+        const pTotalRev = Number(Object.values(pRev).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+        const pTotalExp = Number(Object.values(pExp).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+        const pNoi = pTotalRev - pTotalExp;
+        momNoiChange = pNoi !== 0 ? ((noi - pNoi) / Math.abs(pNoi)) * 100 : 0;
+      }
+
+      return {
+        propertyId: p.id,
+        propertyName: p.name,
+        month: latestRecord.month,
+        revenue: totalRev,
+        noi: noi,
+        occupancy: latestRecord.occupancy || 0,
+        momNoiChange,
+        riskFlag: Math.abs(momNoiChange) > 5 || (latestRecord.occupancy || 0) < 90
+      };
+    });
+
+    res.json(portfolio);
+  });
+
+  // Bulk Sync for persistence across session restarts
+  app.post("/api/sync", (req, res) => {
+    const { properties, records, weeklyData } = req.body;
+    
+    try {
+      const insertProperty = db.prepare(`
+        INSERT INTO properties (id, external_id, name, asset_type, total_beds, market, target_occupancy, competitor_names, competitor_urls)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          external_id = excluded.external_id,
+          name = excluded.name,
+          asset_type = excluded.asset_type,
+          total_beds = excluded.total_beds,
+          market = excluded.market,
+          target_occupancy = excluded.target_occupancy,
+          competitor_names = excluded.competitor_names,
+          competitor_urls = excluded.competitor_urls
+      `);
+
+      const insertRecord = db.prepare(`
+        INSERT INTO monthly_records (id, property_id, month, revenue, expenses, occupancy, preleased_beds)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          property_id = excluded.property_id,
+          month = excluded.month,
+          revenue = excluded.revenue,
+          expenses = excluded.expenses,
+          occupancy = excluded.occupancy,
+          preleased_beds = excluded.preleased_beds
+      `);
+
+      const insertWeekly = db.prepare(`
+        INSERT INTO weekly_prelease (id, property_id, date, beds_leased)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          property_id = excluded.property_id,
+          date = excluded.date,
+          beds_leased = excluded.beds_leased
+      `);
+
+      const insertWeeklySnapshot = db.prepare(`
+        INSERT INTO weekly_prelease_snapshots (
+          id, property_id, week_ending_date, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(property_id, week_ending_date) DO UPDATE SET
+          total_beds = excluded.total_beds,
+          preleased_beds = excluded.preleased_beds,
+          prelease_pct = excluded.prelease_pct,
+          source_system = excluded.source_system,
+          source_ref = excluded.source_ref,
+          data_quality = excluded.data_quality,
+          note = excluded.note,
+          updated_at = CURRENT_TIMESTAMP
+      `);
+
+      const transaction = db.transaction((props: any[], recs: any[], weekly: any[]) => {
+        const validPropertyIds = new Set<string>();
+        
+        // First, insert all properties and collect their IDs
+        for (const p of props) {
+          if (p.id) {
+            insertProperty.run(
+              p.id,
+              p.externalId || null,
+              p.name,
+              p.assetType,
+              p.totalBeds,
+              p.market,
+              p.targetOccupancy,
+              JSON.stringify(p.competitorNames),
+              JSON.stringify(p.competitorUrls || {})
+            );
+            validPropertyIds.add(p.id);
+          }
+        }
+        
+        // Also add existing property IDs from the database to the valid set
+        const existingProps = db.prepare("SELECT id FROM properties").all() as any[];
+        existingProps.forEach(p => validPropertyIds.add(p.id));
+
+        // Only insert records for valid properties to avoid foreign key errors
+        for (const r of recs) {
+          if (r.propertyId && validPropertyIds.has(r.propertyId)) {
+            insertRecord.run(r.id, r.propertyId, r.month, JSON.stringify(r.revenue), JSON.stringify(r.expenses), r.occupancy, r.preleasedBeds);
+          }
+        }
+        
+        for (const w of weekly) {
+          if (w.propertyId && validPropertyIds.has(w.propertyId)) {
+            const week = normalizeToMondayISO(String(w.date || ""));
+            if (!week) continue;
+
+            const propertyMeta = db.prepare("SELECT total_beds FROM properties WHERE id = ?").get(w.propertyId) as any;
+            const totalBeds = Number(propertyMeta?.total_beds || 0);
+            const preleasedBeds = Number(w.bedsLeased || 0);
+            const preleasePct = totalBeds > 0 ? (preleasedBeds / totalBeds) * 100 : 0;
+            const dataQuality = computeQualityFlag({
+              totalBeds,
+              preleasedBeds,
+              previousPct: null,
+              currentPct: preleasePct
+            });
+
+            const snapshotId = w.id || randomUUID();
+            insertWeekly.run(snapshotId, w.propertyId, week, preleasedBeds);
+            insertWeeklySnapshot.run(
+              snapshotId,
+              w.propertyId,
+              week,
+              totalBeds,
+              preleasedBeds,
+              preleasePct,
+              "sync",
+              "api/sync",
+              dataQuality,
+              isMondayISO(String(w.date || "")) ? null : `Normalized from ${w.date} to ${week}`
+            );
+          }
+        }
+      });
+
+      transaction(properties || [], records || [], weeklyData || []);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Sync error:", error);
+      res.status(500).json({ error: "Sync failed", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  if (includeFrontend) {
+    // Vite middleware for development
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      app.use(express.static(path.join(__dirname, "dist")));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(__dirname, "dist", "index.html"));
+      });
+    }
+  }
+
+  return app;
+}
+
+async function startServer() {
+  const PORT = Number(process.env.PORT || 3000);
+  const app = await createApp({ includeFrontend: true });
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+if (process.env.VERCEL !== "1") {
+  startServer();
+}
