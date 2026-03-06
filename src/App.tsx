@@ -30,7 +30,8 @@ import {
   AlertTriangle,
   Calendar,
   Moon,
-  Sun
+  Sun,
+  Info
 } from 'lucide-react';
 import { 
   BarChart, 
@@ -575,23 +576,73 @@ const extractFinancialDataFromFile = async (file: File): Promise<{
   throw new Error('Unsupported file type for AI extraction. Use Excel (.xlsx/.xls) or image files.');
 };
 
+type AttentionLevel = 'Stable' | 'Moderate' | 'Elevated' | 'Critical';
+type AttentionScoreBreakdown = {
+  score: number;
+  level: AttentionLevel;
+  components: {
+    noiVsBudget: number;
+  };
+  metrics: {
+    noiActual: number;
+    noiBudget: number;
+    noiVariance: number;
+    noiVariancePct: number;
+  };
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const round1 = (value: number) => Math.round(value * 10) / 10;
+
+const attentionLevelFromScore = (score: number): AttentionLevel => {
+  if (score >= 8) return 'Critical';
+  if (score >= 6) return 'Elevated';
+  if (score >= 4) return 'Moderate';
+  return 'Stable';
+};
+
+const calculateAttentionScore = (args: {
+  noiActual: number;
+  noiBudget: number;
+}): AttentionScoreBreakdown => {
+  const noiVariance = args.noiActual - args.noiBudget;
+  const noiVariancePct = args.noiBudget !== 0
+    ? (noiVariance / Math.abs(args.noiBudget)) * 100
+    : 0;
+  const noiVsBudgetPoints = noiVariancePct < 0 ? Math.min(9, Math.abs(noiVariancePct) / 3) : 0;
+  const rawScore = 1 + noiVsBudgetPoints;
+  const score = clamp(Math.round(rawScore), 1, 10);
+
+  return {
+    score,
+    level: attentionLevelFromScore(score),
+    components: {
+      noiVsBudget: round1(noiVsBudgetPoints)
+    },
+    metrics: {
+      noiActual: round1(args.noiActual),
+      noiBudget: round1(args.noiBudget),
+      noiVariance: round1(noiVariance),
+      noiVariancePct: round1(noiVariancePct)
+    }
+  };
+};
+
 const buildFallbackAnalysis = (
   profile: AssetProfile,
   currentMonth: string,
   dynamicMoM: MoMAnalysis | null,
   dynamicYTDTrend: { month: string; actualNOI: number; budgetNOI: number }[],
-  weeklyPreleaseData: { date: string; bedsLeased: number }[]
+  weeklyPreleaseData: { date: string; bedsLeased: number }[],
+  attentionBreakdown: AttentionScoreBreakdown
 ): AnalysisResult => {
   const preleasePct = profile.totalBeds > 0 ? (profile.preleasedBeds / profile.totalBeds) * 100 : 0;
   const variance = preleasePct - profile.targetOccupancy;
   const competitorNames = profile.competitorNames.filter(Boolean);
 
-  const severity = Math.abs(variance) > 10 ? 'Critical' : Math.abs(variance) > 5 ? 'Elevated' : Math.abs(variance) > 2 ? 'Moderate' : 'Stable';
-  const attentionScore = Math.max(1, Math.min(10, Math.round(5 + Math.abs(variance) / 2 + (dynamicMoM && Math.abs(dynamicMoM.noiDeltaPct) > 5 ? 1 : 0))));
-
   return {
-    attentionScore,
-    attentionLevel: severity,
+    attentionScore: attentionBreakdown.score,
+    attentionLevel: attentionBreakdown.level,
     preleaseVelocity: {
       current: preleasePct,
       target: profile.targetOccupancy,
@@ -991,6 +1042,7 @@ export default function App() {
   const [lossViewMode, setLossViewMode] = useState<'ytd' | 'month'>('ytd');
   const [lossRankMetric, setLossRankMetric] = useState<'absolute' | 'percent'>('absolute');
   const [lossTopN, setLossTopN] = useState<3 | 5 | 10>(3);
+  const [showAttentionInfo, setShowAttentionInfo] = useState(false);
   const [isEditMode, setIsEditMode] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
@@ -1034,6 +1086,34 @@ export default function App() {
     setAuditLogs(prev => [newLog, ...prev]);
   };
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [viewerSection, setViewerSection] = useState<'financial' | 'leasing' | 'market'>('financial');
+
+  const latestMonthlyUpdate = useMemo(() => {
+    const dates = monthlyRecords
+      .map((r) => r.uploadedAt)
+      .filter(Boolean)
+      .map((d) => new Date(String(d)).getTime())
+      .filter((t) => Number.isFinite(t));
+    if (dates.length === 0) return null;
+    return new Date(Math.max(...dates));
+  }, [monthlyRecords]);
+
+  const latestLeasingUpdate = useMemo(() => {
+    const dates = weeklyPreleaseData
+      .map((r: any) => r.ingestedAt || r.date)
+      .filter(Boolean)
+      .map((d: any) => new Date(String(d)).getTime())
+      .filter((t: number) => Number.isFinite(t));
+    if (dates.length === 0) return null;
+    return new Date(Math.max(...dates));
+  }, [weeklyPreleaseData]);
+
+  React.useEffect(() => {
+    if (!result) return;
+    const monthlyTs = latestMonthlyUpdate?.getTime() || 0;
+    const leasingTs = latestLeasingUpdate?.getTime() || 0;
+    setViewerSection(leasingTs > monthlyTs ? 'leasing' : 'financial');
+  }, [result?.lastRefresh, latestMonthlyUpdate, latestLeasingUpdate]);
 
   React.useEffect(() => {
     document.body.classList.toggle('theme-dark', themeMode === 'dark');
@@ -1298,6 +1378,14 @@ export default function App() {
       };
     });
   }, [monthlyRecords, currentMonth]);
+
+  const attentionBreakdown = useMemo(() => {
+    const noi = calculateNOI(financials);
+    return calculateAttentionScore({
+      noiActual: noi.actual,
+      noiBudget: noi.budget
+    });
+  }, [financials]);
 
   const [isDataLoaded, setIsDataLoaded] = useState(false);
 
@@ -2137,6 +2225,10 @@ export default function App() {
       
       const preleasePct = profile.totalBeds > 0 ? (profile.preleasedBeds / profile.totalBeds) * 100 : 0;
       const preleaseVariance = preleasePct - profile.targetOccupancy;
+      const attentionModel = calculateAttentionScore({
+        noiActual: noi.actual,
+        noiBudget: noi.budget
+      });
 
       // Calculate MoM if prior record exists
       // Filter out the current month if it's already in the records to find the TRUE prior month
@@ -2237,8 +2329,8 @@ export default function App() {
       
       // Ensure data structure is correct
       const finalResult: AnalysisResult = {
-        attentionScore: aiData.attentionScore || 5,
-        attentionLevel: aiData.attentionLevel || 'Moderate',
+        attentionScore: attentionModel.score,
+        attentionLevel: attentionModel.level,
         preleaseVelocity: {
           current: preleasePct,
           target: profile.targetOccupancy,
@@ -2267,7 +2359,13 @@ export default function App() {
       if (isQuotaError(error)) {
         setQuotaExceeded(true);
       }
-      const fallbackResult = buildFallbackAnalysis(profile, currentMonth, dynamicMoM, dynamicYTDTrend, weeklyPreleaseData);
+      const noi = calculateNOI(financials);
+      const preleasePct = profile.totalBeds > 0 ? (profile.preleasedBeds / profile.totalBeds) * 100 : 0;
+      const attentionModel = calculateAttentionScore({
+        noiActual: noi.actual,
+        noiBudget: noi.budget
+      });
+      const fallbackResult = buildFallbackAnalysis(profile, currentMonth, dynamicMoM, dynamicYTDTrend, weeklyPreleaseData, attentionModel);
       fallbackResult.compIntelligence = websiteOnlyCompData.compIntelligence;
       fallbackResult.activePromos = websiteOnlyCompData.activePromos;
       fallbackResult.historicalTimeline = persistedTimeline.length > 0 ? persistedTimeline : fallbackResult.historicalTimeline;
@@ -3122,7 +3220,18 @@ export default function App() {
                       <span className="label-caps text-[10px]">Upload P&L</span>
                     </button>
                     <div className="text-right">
-                    <p className="label-caps">Attention Score</p>
+                    <p className="label-caps flex items-center justify-end gap-1">
+                      <span>Attention Score</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowAttentionInfo(true)}
+                        className="inline-flex items-center justify-center w-4 h-4 rounded-full border border-brand-line text-brand-ink/70 hover:text-brand-ink hover:border-brand-ink/40 transition-colors"
+                        title="How the attention score is calculated"
+                        aria-label="Attention score logic"
+                      >
+                        <Info className="w-3 h-3" />
+                      </button>
+                    </p>
                     <div className="flex items-center gap-3">
                       <span className={`text-4xl font-bold ${
                         result.attentionLevel === 'Critical' ? 'text-red-600' : 
@@ -3143,6 +3252,90 @@ export default function App() {
               </div>
             </div>
 
+              <section className="bg-white p-4 rounded-xl border border-brand-line shadow-sm">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div className="flex items-center gap-2 bg-brand-ink/5 p-1 rounded-lg w-fit">
+                    <button
+                      onClick={() => setViewerSection('financial')}
+                      className={`px-3 py-1.5 rounded-md text-[10px] font-bold uppercase tracking-widest transition ${
+                        viewerSection === 'financial' ? 'bg-brand-ink text-brand-bg' : 'text-brand-ink/60 hover:text-brand-ink'
+                      }`}
+                    >
+                      P&L vs Budget
+                    </button>
+                    <button
+                      onClick={() => setViewerSection('leasing')}
+                      className={`px-3 py-1.5 rounded-md text-[10px] font-bold uppercase tracking-widest transition ${
+                        viewerSection === 'leasing' ? 'bg-brand-ink text-brand-bg' : 'text-brand-ink/60 hover:text-brand-ink'
+                      }`}
+                    >
+                      Prelease Data
+                    </button>
+                    <button
+                      onClick={() => setViewerSection('market')}
+                      className={`px-3 py-1.5 rounded-md text-[10px] font-bold uppercase tracking-widest transition ${
+                        viewerSection === 'market' ? 'bg-brand-ink text-brand-bg' : 'text-brand-ink/60 hover:text-brand-ink'
+                      }`}
+                    >
+                      Market Context
+                    </button>
+                  </div>
+
+                  <div className="text-xs text-brand-ink/60">
+                    {viewerSection === 'financial' && (
+                      <p>Cadence: Monthly review. Last P&L update: {latestMonthlyUpdate ? latestMonthlyUpdate.toLocaleString() : 'No monthly upload yet'}</p>
+                    )}
+                    {viewerSection === 'leasing' && (
+                      <p>Cadence: Weekly/Daily review. Last prelease update: {latestLeasingUpdate ? latestLeasingUpdate.toLocaleString() : 'No weekly upload yet'}</p>
+                    )}
+                    {viewerSection === 'market' && (
+                      <p>Cadence: Weekly market scan. Last market refresh: {result?.lastRefresh ? new Date(result.lastRefresh).toLocaleString() : 'No market scan yet'}</p>
+                    )}
+                  </div>
+                </div>
+              </section>
+
+              {showAttentionInfo && (
+                <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+                  <div className="w-full max-w-xl bg-white border border-brand-line rounded-2xl shadow-2xl p-6 space-y-5">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-lg font-bold">Attention Score Logic</h4>
+                      <button
+                        type="button"
+                        onClick={() => setShowAttentionInfo(false)}
+                        className="p-1 rounded hover:bg-brand-ink/5"
+                        aria-label="Close attention score details"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    <div className="text-sm text-brand-ink/80 space-y-2">
+                      <p>Score range is 1-10. Current formula uses only YTD NOI variance.</p>
+                      <p className="text-xs opacity-70 font-mono">Score = 1 + max(0, -NOI Variance % / 3), capped at 10</p>
+                      <p className="text-xs opacity-70">If YTD NOI is on or above budget, score stays at 1 (Stable). Deeper negative variance increases risk score.</p>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-3 text-xs">
+                      <div className="bg-brand-ink/[0.03] rounded-lg p-3">
+                        <p className="label-caps opacity-50">YTD NOI vs Budget</p>
+                        <p className="font-mono mt-1">Actual {formatCurrency(attentionBreakdown.metrics.noiActual)}</p>
+                        <p className="font-mono">Budget {formatCurrency(attentionBreakdown.metrics.noiBudget)}</p>
+                        <p className="font-mono">Variance {formatCurrency(attentionBreakdown.metrics.noiVariance)} ({attentionBreakdown.metrics.noiVariancePct.toFixed(1)}%)</p>
+                        <p className="font-mono mt-1">Risk points from NOI variance: +{attentionBreakdown.components.noiVsBudget.toFixed(1)}</p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between border-t border-brand-line pt-4">
+                      <p className="label-caps opacity-50">Current Output</p>
+                      <p className="font-mono font-bold">Score {result.attentionScore}/10 ({result.attentionLevel})</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {viewerSection === 'financial' && (
+              <>
               {/* MoM & YTD Snapshot */}
               <section className="grid grid-cols-1 md:grid-cols-2 gap-8">
                 <div className="space-y-4">
@@ -3180,8 +3373,11 @@ export default function App() {
                   </div>
                 </div>
               </section>
+              </>
+              )}
 
               {/* Prelease Velocity Rail */}
+              {viewerSection === 'leasing' && (
               <section className="bg-white p-6 rounded-2xl border border-brand-line shadow-sm">
                 <div className="flex justify-between items-center mb-6">
                   <h3 className="label-caps flex items-center gap-2">
@@ -3265,8 +3461,10 @@ export default function App() {
                   </div>
                 </div>
               </section>
+              )}
 
               {/* YTD Trend Chart */}
+              {viewerSection === 'financial' && (
               <section className="bg-white p-6 rounded-2xl border border-brand-line shadow-sm">
                 <h3 className="label-caps flex items-center gap-2 mb-6">
                   <TrendingUp className="w-4 h-4" /> YTD Financial Trend (Actual vs Budget NOI)
@@ -3300,7 +3498,9 @@ export default function App() {
                   </div>
                 </div>
               </section>
+              )}
 
+              {viewerSection === 'market' && (
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                 {/* Active Alerts Feed */}
                 <section className="lg:col-span-1 space-y-4">
@@ -3460,8 +3660,11 @@ export default function App() {
                   </div>
                 </section>
               </div>
+              )}
 
               {/* NOI Loss Drivers */}
+              {viewerSection === 'financial' && (
+              <>
               <section className="bg-white p-6 rounded-2xl border border-brand-line shadow-sm space-y-5">
                 <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
                   <div>
@@ -3575,6 +3778,8 @@ export default function App() {
                   </ul>
                 </div>
               </section>
+              </>
+              )}
 
               <div className="flex justify-center pt-8">
                 <button 
