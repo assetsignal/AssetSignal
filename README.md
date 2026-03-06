@@ -83,3 +83,27 @@ Optional env vars:
 
 Audit endpoint:
 - `GET /api/weekly-prelease/audit/:propertyId?limit=100`
+
+## Migrate SQLite -> Hosted Postgres
+Use this when moving from local `assetsignal.db` to a hosted Postgres service (Supabase/Neon/Vercel Postgres).
+
+1. Create a Postgres database and copy its connection string.
+2. Set env var:
+   ```bash
+   export DATABASE_URL='postgres://...'
+   ```
+3. Install deps:
+   ```bash
+   npm install
+   ```
+4. Run migration:
+   ```bash
+   npm run db:migrate:postgres
+   ```
+5. What it does:
+   - Creates tables from `scripts/postgres-schema.sql`
+   - Copies all rows from `assetsignal.db`
+   - Upserts on keys/uniques so reruns are safe
+
+Optional env var:
+- `SQLITE_PATH` (default `./assetsignal.db`)

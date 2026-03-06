@@ -12,7 +12,8 @@
     "start": "tsx server.ts",
     "scrape:rise": "node scripts/scrape-rise.mjs",
     "ingest:weekly-demo": "node scripts/ingest-weekly-demo.mjs",
-    "seed:fake-property": "node scripts/seed-fake-property.mjs"
+    "seed:fake-property": "node scripts/seed-fake-property.mjs",
+    "db:migrate:postgres": "node scripts/migrate-sqlite-to-postgres.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
@@ -25,6 +26,7 @@
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "pg": "^8.20.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
