@@ -988,6 +988,9 @@ export default function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [isWeeklyImporting, setIsWeeklyImporting] = useState(false);
   const [showPromoRepeats, setShowPromoRepeats] = useState(false);
+  const [lossViewMode, setLossViewMode] = useState<'ytd' | 'month'>('ytd');
+  const [lossRankMetric, setLossRankMetric] = useState<'absolute' | 'percent'>('absolute');
+  const [lossTopN, setLossTopN] = useState<3 | 5 | 10>(3);
   const [isEditMode, setIsEditMode] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
@@ -1174,6 +1177,61 @@ export default function App() {
       .map(([competitorName, promos]) => ({ competitorName, promos }))
       .sort((a, b) => a.competitorName.localeCompare(b.competitorName));
   }, [canonicalPromos]);
+
+  const noiLossDrivers = useMemo(() => {
+    type Line = {
+      section: 'Revenue' | 'Expense';
+      accountCode: string;
+      name: string;
+      actual: number;
+      budget: number;
+      lossAbs: number;
+      lossPct: number;
+    };
+
+    const toLines = (
+      section: 'Revenue' | 'Expense',
+      entries: Record<string, FinancialCategory>
+    ): Line[] => {
+      const lines: Line[] = [];
+      const fieldActual = lossViewMode === 'ytd' ? 'actual' : 'currentMonthActual';
+      const fieldBudget = lossViewMode === 'ytd' ? 'budget' : 'currentMonthBudget';
+
+      for (const cat of Object.values(entries)) {
+        const rows = cat.subcategories && cat.subcategories.length > 0 ? cat.subcategories : [cat];
+        for (const row of rows) {
+          const actual = Number((row as any)[fieldActual] || 0);
+          const budget = Number((row as any)[fieldBudget] || 0);
+          const rawLoss = section === 'Revenue' ? budget - actual : actual - budget;
+          const lossAbs = Number.isFinite(rawLoss) ? rawLoss : 0;
+          const lossPct = Math.abs(budget) > 0 ? (lossAbs / Math.abs(budget)) * 100 : 0;
+          lines.push({
+            section,
+            accountCode: row.accountCode || '',
+            name: row.name,
+            actual,
+            budget,
+            lossAbs,
+            lossPct
+          });
+        }
+      }
+      return lines;
+    };
+
+    const allLines = [
+      ...toLines('Revenue', financials.revenue),
+      ...toLines('Expense', financials.expenses),
+    ]
+      .filter((l) => l.lossAbs > 0)
+      .sort((a, b) => {
+        const av = lossRankMetric === 'absolute' ? a.lossAbs : a.lossPct;
+        const bv = lossRankMetric === 'absolute' ? b.lossAbs : b.lossPct;
+        return bv - av;
+      });
+
+    return allLines.slice(0, lossTopN);
+  }, [financials, lossViewMode, lossRankMetric, lossTopN]);
 
   // Dynamic MoM Analysis for Dashboard
   const dynamicMoM = useMemo(() => {
@@ -3402,6 +3460,91 @@ export default function App() {
                   </div>
                 </section>
               </div>
+
+              {/* NOI Loss Drivers */}
+              <section className="bg-white p-6 rounded-2xl border border-brand-line shadow-sm space-y-5">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div>
+                    <h3 className="label-caps flex items-center gap-2 text-rose-600">
+                      <AlertTriangle className="w-4 h-4" /> NOI Loss Drivers (GL Red Flags)
+                    </h3>
+                    <p className="text-xs text-brand-ink/60 mt-1">
+                      Ranked in descending order by the largest negative NOI impact.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap md:justify-end">
+                    <select
+                      className="text-[11px] font-semibold bg-white border border-brand-line rounded-md px-2.5 py-1.5"
+                      value={lossViewMode}
+                      onChange={(e) => setLossViewMode(e.target.value as 'ytd' | 'month')}
+                    >
+                      <option value="ytd">Budget YTD vs Actual YTD</option>
+                      <option value="month">This Month Budget vs This Month Actual</option>
+                    </select>
+                    <select
+                      className="text-[11px] font-semibold bg-white border border-brand-line rounded-md px-2.5 py-1.5"
+                      value={lossRankMetric}
+                      onChange={(e) => setLossRankMetric(e.target.value as 'absolute' | 'percent')}
+                    >
+                      <option value="absolute">Rank by Absolute $</option>
+                      <option value="percent">Rank by %</option>
+                    </select>
+                    <select
+                      className="text-[11px] font-semibold bg-white border border-brand-line rounded-md px-2.5 py-1.5"
+                      value={lossTopN}
+                      onChange={(e) => setLossTopN(Number(e.target.value) as 3 | 5 | 10)}
+                    >
+                      <option value={3}>Top 3</option>
+                      <option value={5}>Top 5</option>
+                      <option value={10}>Top 10</option>
+                    </select>
+                  </div>
+                </div>
+
+                {noiLossDrivers.length === 0 ? (
+                  <div className="p-4 rounded-xl border border-emerald-200 bg-emerald-50/60 text-emerald-800 text-sm">
+                    No material negative NOI drivers detected for the selected comparison view.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-xl border border-brand-line">
+                    <table className="w-full text-xs">
+                      <thead className="bg-brand-ink/[0.03] border-b border-brand-line">
+                        <tr>
+                          <th className="p-3 text-left label-caps">Rank</th>
+                          <th className="p-3 text-left label-caps">GL Line</th>
+                          <th className="p-3 text-left label-caps">Type</th>
+                          <th className="p-3 text-right label-caps">Budget</th>
+                          <th className="p-3 text-right label-caps">Actual</th>
+                          <th className="p-3 text-right label-caps">NOI Loss ($)</th>
+                          <th className="p-3 text-right label-caps">NOI Loss (%)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {noiLossDrivers.map((line, idx) => (
+                          <tr key={`${line.section}-${line.accountCode}-${line.name}-${idx}`} className="border-b border-brand-line/70 last:border-0">
+                            <td className="p-3 font-bold text-rose-600">#{idx + 1}</td>
+                            <td className="p-3">
+                              <div className="font-semibold">{line.name}</div>
+                              <div className="opacity-50 font-mono text-[10px]">{line.accountCode || 'N/A'}</div>
+                            </td>
+                            <td className="p-3">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
+                                line.section === 'Revenue' ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700'
+                              }`}>
+                                {line.section}
+                              </span>
+                            </td>
+                            <td className="p-3 text-right font-mono">{formatCurrency(line.budget)}</td>
+                            <td className="p-3 text-right font-mono">{formatCurrency(line.actual)}</td>
+                            <td className="p-3 text-right font-mono text-rose-600">-{formatCurrency(line.lossAbs)}</td>
+                            <td className="p-3 text-right font-mono text-rose-600">{line.lossPct.toFixed(1)}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
 
               {/* Probing Questions for PMs */}
               <section className="grid grid-cols-1 md:grid-cols-2 gap-8">
