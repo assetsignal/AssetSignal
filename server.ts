@@ -1,5 +1,6 @@
 import express from "express";
-import { Pool, PoolClient } from "pg";
+import pg from "pg";
+import type { PoolClient } from "pg";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -16,6 +17,7 @@ if (!DATABASE_URL) {
   throw new Error("DATABASE_URL is required. This app now runs on hosted Postgres.");
 }
 
+const { Pool } = pg;
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
