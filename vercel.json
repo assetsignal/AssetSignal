@@ -1,6 +1,14 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "includeFiles": [
+        "server.ts",
+        "assetsignal.db"
+      ]
+    }
+  },
   "rewrites": [
     {
       "source": "/api/(.*)",
