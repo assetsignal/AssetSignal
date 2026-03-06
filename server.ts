@@ -1,5 +1,5 @@
 import express from "express";
-import Database from "better-sqlite3";
+import { Pool, PoolClient } from "pg";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -11,132 +11,54 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const localDbPath = path.join(__dirname, "assetsignal.db");
-const runtimeDbPath = process.env.VERCEL ? "/tmp/assetsignal.db" : localDbPath;
-
-if (process.env.VERCEL && !fs.existsSync(runtimeDbPath) && fs.existsSync(localDbPath)) {
-  fs.copyFileSync(localDbPath, runtimeDbPath);
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  throw new Error("DATABASE_URL is required. This app now runs on hosted Postgres.");
 }
 
-const db = new Database(runtimeDbPath);
-db.pragma('foreign_keys = ON');
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-// Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS properties (
-    id TEXT PRIMARY KEY,
-    external_id TEXT,
-    name TEXT NOT NULL,
-    asset_type TEXT DEFAULT 'Student Housing',
-    total_beds INTEGER DEFAULT 0,
-    market TEXT,
-    target_occupancy REAL DEFAULT 0,
-    competitor_names TEXT, -- JSON array
-    competitor_urls TEXT, -- JSON object
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
+const postgresSchemaPath = path.join(__dirname, "scripts", "postgres-schema.sql");
+let schemaInitialized = false;
 
-  CREATE TABLE IF NOT EXISTS monthly_records (
-    id TEXT PRIMARY KEY,
-    property_id TEXT NOT NULL,
-    month TEXT NOT NULL, -- YYYY-MM
-    revenue TEXT, -- JSON FinancialCategory
-    expenses TEXT, -- JSON FinancialCategory
-    occupancy REAL DEFAULT 0,
-    preleased_beds INTEGER DEFAULT 0,
-    uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE
-  );
+async function initPostgresSchema() {
+  if (schemaInitialized) return;
+  const schemaSql = fs.readFileSync(postgresSchemaPath, "utf8");
+  await pool.query(schemaSql);
+  schemaInitialized = true;
+}
 
-  CREATE TABLE IF NOT EXISTS weekly_prelease (
-    id TEXT PRIMARY KEY,
-    property_id TEXT NOT NULL,
-    date TEXT NOT NULL, -- YYYY-MM-DD
-    beds_leased INTEGER DEFAULT 0,
-    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE
-  );
+async function pgRows<T = any>(sql: string, params: any[] = [], client?: PoolClient): Promise<T[]> {
+  const runner = client ?? pool;
+  const result = await runner.query(sql, params);
+  return result.rows as T[];
+}
 
-  CREATE TABLE IF NOT EXISTS comp_pricing (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    property_name TEXT,
-    floor_plan TEXT,
-    rent REAL,
-    date TEXT
-  );
+async function pgOne<T = any>(sql: string, params: any[] = [], client?: PoolClient): Promise<T | null> {
+  const rows = await pgRows<T>(sql, params, client);
+  return rows[0] ?? null;
+}
 
-  CREATE TABLE IF NOT EXISTS weekly_prelease_snapshots (
-    id TEXT PRIMARY KEY,
-    property_id TEXT NOT NULL,
-    week_ending_date TEXT NOT NULL, -- YYYY-MM-DD (Monday)
-    total_beds INTEGER NOT NULL,
-    preleased_beds INTEGER NOT NULL,
-    prelease_pct REAL NOT NULL,
-    source_system TEXT NOT NULL,
-    source_ref TEXT,
-    data_quality TEXT NOT NULL DEFAULT 'valid',
-    note TEXT,
-    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE,
-    UNIQUE(property_id, week_ending_date)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_weekly_prelease_snapshots_property_week
-    ON weekly_prelease_snapshots(property_id, week_ending_date DESC);
-
-  CREATE TABLE IF NOT EXISTS weekly_prelease_audit (
-    id TEXT PRIMARY KEY,
-    snapshot_id TEXT NOT NULL,
-    action TEXT NOT NULL, -- create|update|override
-    old_value TEXT,
-    new_value TEXT,
-    actor TEXT NOT NULL,
-    reason TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (snapshot_id) REFERENCES weekly_prelease_snapshots(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS concession_history (
-    id TEXT PRIMARY KEY,
-    property_id TEXT NOT NULL,
-    snapshot_date TEXT NOT NULL, -- YYYY-MM-DD
-    promo_count INTEGER NOT NULL DEFAULT 0,
-    avg_rent REAL NOT NULL DEFAULT 0,
-    source_system TEXT NOT NULL DEFAULT 'market_scan',
-    notes TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE,
-    UNIQUE(property_id, snapshot_date)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_concession_history_property_date
-    ON concession_history(property_id, snapshot_date ASC);
-`);
-
-// Migration: Ensure all columns exist in properties table
-try {
-  const tableInfo = db.prepare("PRAGMA table_info(properties)").all() as any[];
-  const columns = tableInfo.map(col => col.name);
-  
-  const requiredColumns = [
-    { name: 'external_id', type: "TEXT" },
-    { name: 'asset_type', type: "TEXT DEFAULT 'Student Housing'" },
-    { name: 'total_beds', type: "INTEGER DEFAULT 0" },
-    { name: 'target_occupancy', type: "REAL DEFAULT 0" },
-    { name: 'competitor_names', type: "TEXT" },
-    { name: 'competitor_urls', type: "TEXT" }
-  ];
-
-  for (const col of requiredColumns) {
-    if (!columns.includes(col.name)) {
-      db.exec(`ALTER TABLE properties ADD COLUMN ${col.name} ${col.type}`);
-      console.log(`Migration: Added ${col.name} column to properties table`);
-    }
+async function inPgTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await fn(client);
+    await client.query("COMMIT");
+    return out;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
-} catch (e) {
-  console.error("Migration error:", e);
 }
+
+// Legacy SQLite handlers remain below for reference, but runtime is Postgres-only.
+const db: any = null;
 
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 
@@ -722,6 +644,7 @@ async function extractFloorplanRangesWithAI(input: {
 }
 
 export async function createApp(options: { includeFrontend?: boolean } = {}) {
+  await initPostgresSchema();
   const app = express();
   const includeFrontend = options.includeFrontend ?? false;
 
@@ -1021,6 +944,866 @@ export async function createApp(options: { includeFrontend?: boolean } = {}) {
     } catch (error) {
       console.error("Comp scan error:", error);
       res.status(500).json({ error: "Comp scan failed", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // Postgres-backed data routes
+  app.get("/api/properties", async (req, res) => {
+    try {
+      const properties = await pgRows("SELECT * FROM properties ORDER BY name ASC");
+      res.json(properties.map((p: any) => ({
+        ...p,
+        competitorNames: JSON.parse(p.competitor_names || "[]"),
+        competitorUrls: JSON.parse(p.competitor_urls || "{}"),
+        assetType: p.asset_type,
+        totalBeds: p.total_beds,
+        targetOccupancy: p.target_occupancy,
+        externalId: p.external_id,
+        createdAt: p.created_at,
+      })));
+    } catch (error) {
+      console.error("Properties fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch properties", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/properties", async (req, res) => {
+    try {
+      const { id, externalId, name, assetType, totalBeds, market, targetOccupancy, competitorNames, competitorUrls } = req.body;
+      await pgRows(
+        `INSERT INTO properties (id, external_id, name, asset_type, total_beds, market, target_occupancy, competitor_names, competitor_urls)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          id,
+          externalId || null,
+          name,
+          assetType,
+          totalBeds,
+          market,
+          targetOccupancy,
+          JSON.stringify(competitorNames || []),
+          JSON.stringify(competitorUrls || {}),
+        ]
+      );
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Property create error:", error);
+      res.status(500).json({ error: "Failed to create property", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.put("/api/properties/:id", async (req, res) => {
+    try {
+      const { externalId, name, totalBeds, market, targetOccupancy, competitorNames, competitorUrls } = req.body;
+      await pgRows(
+        `UPDATE properties
+         SET external_id = $1, name = $2, total_beds = $3, market = $4, target_occupancy = $5, competitor_names = $6, competitor_urls = $7
+         WHERE id = $8`,
+        [
+          externalId || null,
+          name,
+          totalBeds,
+          market,
+          targetOccupancy,
+          JSON.stringify(competitorNames || []),
+          JSON.stringify(competitorUrls || {}),
+          req.params.id,
+        ]
+      );
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Property update error:", error);
+      res.status(500).json({ error: "Failed to update property", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/properties/:id/records", async (req, res) => {
+    try {
+      const records = await pgRows("SELECT * FROM monthly_records WHERE property_id = $1 ORDER BY month DESC", [req.params.id]);
+      res.json(records.map((r: any) => ({
+        ...r,
+        propertyId: r.property_id,
+        revenue: JSON.parse(r.revenue || "{}"),
+        expenses: JSON.parse(r.expenses || "{}"),
+        uploadedAt: r.uploaded_at,
+      })));
+    } catch (error) {
+      console.error("Records fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch records", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/properties/:id/records", async (req, res) => {
+    try {
+      const { id, month, revenue, expenses, occupancy, preleasedBeds } = req.body;
+      const property = await pgOne("SELECT id FROM properties WHERE id = $1", [req.params.id]);
+      if (!property) return res.status(404).json({ error: "Property not found" });
+
+      const existing = await pgOne<any>(
+        "SELECT id FROM monthly_records WHERE property_id = $1 AND month = $2",
+        [req.params.id, month]
+      );
+
+      if (existing) {
+        await pgRows(
+          `UPDATE monthly_records
+           SET revenue = $1, expenses = $2, occupancy = $3, preleased_beds = $4, uploaded_at = CURRENT_TIMESTAMP
+           WHERE id = $5`,
+          [JSON.stringify(revenue), JSON.stringify(expenses), occupancy, preleasedBeds, existing.id]
+        );
+      } else {
+        await pgRows(
+          `INSERT INTO monthly_records (id, property_id, month, revenue, expenses, occupancy, preleased_beds)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [id, req.params.id, month, JSON.stringify(revenue), JSON.stringify(expenses), occupancy, preleasedBeds]
+        );
+      }
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Record upsert error:", error);
+      res.status(500).json({ error: "Failed to save record", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get("/api/properties/:id/weekly-prelease", async (req, res) => {
+    try {
+      const snapshotData = await pgRows(
+        `SELECT id, property_id, week_ending_date, preleased_beds, total_beds, prelease_pct, source_system, data_quality, ingested_at
+         FROM weekly_prelease_snapshots
+         WHERE property_id = $1
+         ORDER BY week_ending_date ASC`,
+        [req.params.id]
+      );
+
+      if (snapshotData.length > 0) {
+        return res.json(snapshotData.map((d: any) => ({
+          id: d.id,
+          propertyId: d.property_id,
+          date: d.week_ending_date,
+          bedsLeased: d.preleased_beds,
+          totalBeds: d.total_beds,
+          preleasePct: d.prelease_pct,
+          sourceSystem: d.source_system,
+          dataQuality: d.data_quality,
+          ingestedAt: d.ingested_at,
+        })));
+      }
+
+      const legacyData = await pgRows("SELECT * FROM weekly_prelease WHERE property_id = $1 ORDER BY date ASC", [req.params.id]);
+      return res.json(legacyData.map((d: any) => ({
+        ...d,
+        propertyId: d.property_id,
+        bedsLeased: d.beds_leased,
+      })));
+    } catch (error) {
+      console.error("Weekly prelease fetch error:", error);
+      return res.status(500).json({ error: "Failed to fetch weekly prelease", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/properties/:id/weekly-prelease", async (req, res) => {
+    try {
+      const { id, date, bedsLeased } = req.body;
+      const dateStr = String(date || "");
+      const property = await pgOne<any>("SELECT id, total_beds FROM properties WHERE id = $1", [req.params.id]);
+      if (!property) return res.status(404).json({ error: "Property not found" });
+
+      const weekEndingDate = normalizeToMondayISO(dateStr);
+      if (!weekEndingDate) {
+        return res.status(400).json({ error: "Invalid date", message: "date must be YYYY-MM-DD" });
+      }
+
+      const totalBeds = Number(property.total_beds || 0);
+      const preleasedBeds = Number(bedsLeased || 0);
+      const preleasePct = totalBeds > 0 ? (preleasedBeds / totalBeds) * 100 : 0;
+
+      const prior = await pgOne<any>(
+        `SELECT prelease_pct FROM weekly_prelease_snapshots
+         WHERE property_id = $1 AND week_ending_date < $2
+         ORDER BY week_ending_date DESC
+         LIMIT 1`,
+        [req.params.id, weekEndingDate]
+      );
+
+      const dataQuality = computeQualityFlag({
+        totalBeds,
+        preleasedBeds,
+        previousPct: prior ? Number(prior.prelease_pct) : null,
+        currentPct: preleasePct,
+      });
+
+      const existingSnapshot = await pgOne<any>(
+        `SELECT id, total_beds, preleased_beds, prelease_pct, source_system, data_quality
+         FROM weekly_prelease_snapshots
+         WHERE property_id = $1 AND week_ending_date = $2`,
+        [req.params.id, weekEndingDate]
+      );
+
+      const snapshotId = existingSnapshot?.id || id || randomUUID();
+      const nextSnapshot = {
+        id: snapshotId,
+        property_id: req.params.id,
+        week_ending_date: weekEndingDate,
+        total_beds: totalBeds,
+        preleased_beds: preleasedBeds,
+        prelease_pct: preleasePct,
+        source_system: "manual",
+        source_ref: "ui",
+        data_quality: dataQuality,
+        note: isMondayISO(dateStr) ? null : `Normalized from ${dateStr} to ${weekEndingDate}`,
+      };
+
+      await inPgTransaction(async (client) => {
+        if (existingSnapshot) {
+          await pgRows(
+            `UPDATE weekly_prelease_snapshots
+             SET total_beds = $1, preleased_beds = $2, prelease_pct = $3, source_system = $4, source_ref = $5, data_quality = $6, note = $7, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $8`,
+            [
+              nextSnapshot.total_beds,
+              nextSnapshot.preleased_beds,
+              nextSnapshot.prelease_pct,
+              nextSnapshot.source_system,
+              nextSnapshot.source_ref,
+              nextSnapshot.data_quality,
+              nextSnapshot.note,
+              snapshotId,
+            ],
+            client
+          );
+
+          await pgRows(
+            `INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+             VALUES ($1, $2, 'update', $3, $4, 'ui-user', $5)`,
+            [
+              randomUUID(),
+              snapshotId,
+              JSON.stringify(existingSnapshot),
+              JSON.stringify(nextSnapshot),
+              "manual weekly prelease update",
+            ],
+            client
+          );
+        } else {
+          await pgRows(
+            `INSERT INTO weekly_prelease_snapshots (
+               id, property_id, week_ending_date, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [
+              nextSnapshot.id,
+              nextSnapshot.property_id,
+              nextSnapshot.week_ending_date,
+              nextSnapshot.total_beds,
+              nextSnapshot.preleased_beds,
+              nextSnapshot.prelease_pct,
+              nextSnapshot.source_system,
+              nextSnapshot.source_ref,
+              nextSnapshot.data_quality,
+              nextSnapshot.note,
+            ],
+            client
+          );
+
+          await pgRows(
+            `INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+             VALUES ($1, $2, 'create', NULL, $3, 'ui-user', $4)`,
+            [randomUUID(), snapshotId, JSON.stringify(nextSnapshot), "manual weekly prelease create"],
+            client
+          );
+        }
+
+        const legacy = await pgOne<any>(
+          "SELECT id FROM weekly_prelease WHERE property_id = $1 AND date = $2 LIMIT 1",
+          [req.params.id, weekEndingDate],
+          client
+        );
+        if (legacy) {
+          await pgRows("UPDATE weekly_prelease SET beds_leased = $1 WHERE id = $2", [preleasedBeds, legacy.id], client);
+        } else {
+          await pgRows(
+            "INSERT INTO weekly_prelease (id, property_id, date, beds_leased) VALUES ($1, $2, $3, $4)",
+            [snapshotId, req.params.id, weekEndingDate, preleasedBeds],
+            client
+          );
+        }
+      });
+
+      return res.json({
+        success: true,
+        weekEndingDate,
+        normalizedDate: weekEndingDate !== dateStr,
+        dataQuality,
+      });
+    } catch (error) {
+      console.error("Weekly prelease upsert error:", error);
+      return res.status(500).json({ error: "Failed to save weekly prelease", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/ingest/weekly-prelease", async (req, res) => {
+    const { sourceSystem, runId, rows } = req.body as {
+      sourceSystem?: string;
+      runId?: string;
+      rows?: WeeklyPreleaseRow[];
+    };
+
+    if (!sourceSystem || !Array.isArray(rows)) {
+      return res.status(400).json({
+        error: "Invalid payload",
+        message: "sourceSystem and rows[] are required",
+      });
+    }
+
+    const inserted: any[] = [];
+    const updated: any[] = [];
+    const rejected: any[] = [];
+    const warnings: any[] = [];
+
+    try {
+      await inPgTransaction(async (client) => {
+        for (const row of rows) {
+          const external = String(row.propertyExternalId || "").trim();
+          const weekRaw = String(row.weekEndingDate || "").trim();
+          const normalizedWeek = normalizeToMondayISO(weekRaw);
+          const inputTotalBeds = Number(row.totalBeds);
+          const inputPreleasedBeds = Number(row.preleasedBeds);
+
+          if (!external) {
+            rejected.push({ row, reason: "propertyExternalId is required" });
+            continue;
+          }
+          if (!normalizedWeek) {
+            rejected.push({ row, reason: "weekEndingDate must be YYYY-MM-DD" });
+            continue;
+          }
+          if (!Number.isFinite(inputPreleasedBeds) || inputPreleasedBeds < 0) {
+            rejected.push({ row, reason: "preleasedBeds must be a non-negative number" });
+            continue;
+          }
+
+          const property = await pgOne<any>(
+            `SELECT id, total_beds, external_id, name
+             FROM properties
+             WHERE id = $1 OR external_id = $1 OR lower(name) = lower($1)
+             LIMIT 1`,
+            [external],
+            client
+          );
+
+          if (!property) {
+            rejected.push({ row, reason: `Property not mapped for '${external}'` });
+            continue;
+          }
+
+          const totalBeds = Number.isFinite(inputTotalBeds) && inputTotalBeds > 0
+            ? inputTotalBeds
+            : Number(property.total_beds || 0);
+          const preleasedBeds = inputPreleasedBeds;
+          const preleasePct = totalBeds > 0 ? (preleasedBeds / totalBeds) * 100 : 0;
+
+          const prior = await pgOne<any>(
+            `SELECT prelease_pct FROM weekly_prelease_snapshots
+             WHERE property_id = $1 AND week_ending_date < $2
+             ORDER BY week_ending_date DESC
+             LIMIT 1`,
+            [property.id, normalizedWeek],
+            client
+          );
+
+          const dataQuality = computeQualityFlag({
+            totalBeds,
+            preleasedBeds,
+            previousPct: prior ? Number(prior.prelease_pct) : null,
+            currentPct: preleasePct,
+          });
+
+          if (dataQuality === "error") {
+            rejected.push({ row, reason: "Validation failed (beds/prelease out of bounds)" });
+            continue;
+          }
+
+          if (!isMondayISO(weekRaw)) {
+            warnings.push({ row, reason: `weekEndingDate normalized to Monday ${normalizedWeek}` });
+          }
+          if (dataQuality === "warning") {
+            warnings.push({ row, reason: "Large week-over-week prelease change detected" });
+          }
+
+          const existing = await pgOne<any>(
+            `SELECT id, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+             FROM weekly_prelease_snapshots
+             WHERE property_id = $1 AND week_ending_date = $2`,
+            [property.id, normalizedWeek],
+            client
+          );
+
+          const snapshotId = existing?.id || randomUUID();
+          const nextSnapshot = {
+            id: snapshotId,
+            property_id: property.id,
+            week_ending_date: normalizedWeek,
+            total_beds: totalBeds,
+            preleased_beds: preleasedBeds,
+            prelease_pct: preleasePct,
+            source_system: sourceSystem,
+            source_ref: runId || null,
+            data_quality: dataQuality,
+            note: !isMondayISO(weekRaw) ? `Normalized from ${weekRaw} to ${normalizedWeek}` : null,
+          };
+
+          if (existing) {
+            await pgRows(
+              `UPDATE weekly_prelease_snapshots
+               SET total_beds = $1, preleased_beds = $2, prelease_pct = $3, source_system = $4, source_ref = $5, data_quality = $6, note = $7, updated_at = CURRENT_TIMESTAMP
+               WHERE id = $8`,
+              [
+                nextSnapshot.total_beds,
+                nextSnapshot.preleased_beds,
+                nextSnapshot.prelease_pct,
+                nextSnapshot.source_system,
+                nextSnapshot.source_ref,
+                nextSnapshot.data_quality,
+                nextSnapshot.note,
+                snapshotId,
+              ],
+              client
+            );
+
+            await pgRows(
+              `INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+               VALUES ($1, $2, 'update', $3, $4, 'system', $5)`,
+              [
+                randomUUID(),
+                snapshotId,
+                JSON.stringify(existing),
+                JSON.stringify(nextSnapshot),
+                runId ? `ingest run ${runId}` : "scheduled ingestion",
+              ],
+              client
+            );
+            updated.push({ propertyId: property.id, weekEndingDate: normalizedWeek });
+          } else {
+            await pgRows(
+              `INSERT INTO weekly_prelease_snapshots (
+                 id, property_id, week_ending_date, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+              [
+                nextSnapshot.id,
+                nextSnapshot.property_id,
+                nextSnapshot.week_ending_date,
+                nextSnapshot.total_beds,
+                nextSnapshot.preleased_beds,
+                nextSnapshot.prelease_pct,
+                nextSnapshot.source_system,
+                nextSnapshot.source_ref,
+                nextSnapshot.data_quality,
+                nextSnapshot.note,
+              ],
+              client
+            );
+
+            await pgRows(
+              `INSERT INTO weekly_prelease_audit (id, snapshot_id, action, old_value, new_value, actor, reason)
+               VALUES ($1, $2, 'create', NULL, $3, 'system', $4)`,
+              [
+                randomUUID(),
+                snapshotId,
+                JSON.stringify(nextSnapshot),
+                runId ? `ingest run ${runId}` : "scheduled ingestion",
+              ],
+              client
+            );
+            inserted.push({ propertyId: property.id, weekEndingDate: normalizedWeek });
+          }
+
+          const legacy = await pgOne<any>(
+            "SELECT id FROM weekly_prelease WHERE property_id = $1 AND date = $2 LIMIT 1",
+            [property.id, normalizedWeek],
+            client
+          );
+          if (legacy) {
+            await pgRows("UPDATE weekly_prelease SET beds_leased = $1 WHERE id = $2", [preleasedBeds, legacy.id], client);
+          } else {
+            await pgRows(
+              "INSERT INTO weekly_prelease (id, property_id, date, beds_leased) VALUES ($1, $2, $3, $4)",
+              [snapshotId, property.id, normalizedWeek, preleasedBeds],
+              client
+            );
+          }
+        }
+      });
+
+      return res.json({
+        inserted: inserted.length,
+        updated: updated.length,
+        rejected: rejected.length,
+        warnings: warnings.length,
+        insertedRows: inserted,
+        updatedRows: updated,
+        rejectedRows: rejected,
+        warningRows: warnings,
+      });
+    } catch (error) {
+      console.error("Weekly ingest error:", error);
+      return res.status(500).json({
+        error: "Weekly prelease ingestion failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  app.get("/api/weekly-prelease/audit/:propertyId", async (req, res) => {
+    try {
+      const propertyId = req.params.propertyId;
+      const limitRaw = Number(req.query.limit);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 500) : 100;
+
+      const property = await pgOne<any>(
+        `SELECT id, name, external_id
+         FROM properties
+         WHERE id = $1 OR external_id = $1 OR lower(name) = lower($1)
+         LIMIT 1`,
+        [propertyId]
+      );
+      if (!property) {
+        return res.status(404).json({
+          error: "Property not found",
+          message: `No property matched '${propertyId}'`,
+        });
+      }
+
+      const rows = await pgRows<any>(
+        `SELECT
+           a.id,
+           a.snapshot_id,
+           a.action,
+           a.old_value,
+           a.new_value,
+           a.actor,
+           a.reason,
+           a.created_at,
+           s.week_ending_date,
+           s.data_quality,
+           s.source_system
+         FROM weekly_prelease_audit a
+         JOIN weekly_prelease_snapshots s ON s.id = a.snapshot_id
+         WHERE s.property_id = $1
+         ORDER BY a.created_at DESC
+         LIMIT $2`,
+        [property.id, limit]
+      );
+
+      return res.json({
+        property: {
+          id: property.id,
+          name: property.name,
+          externalId: property.external_id || null,
+        },
+        count: rows.length,
+        rows: rows.map((r) => ({
+          id: r.id,
+          snapshotId: r.snapshot_id,
+          action: r.action,
+          oldValue: r.old_value ? JSON.parse(r.old_value) : null,
+          newValue: r.new_value ? JSON.parse(r.new_value) : null,
+          actor: r.actor,
+          reason: r.reason,
+          createdAt: r.created_at,
+          weekEndingDate: r.week_ending_date,
+          dataQuality: r.data_quality,
+          sourceSystem: r.source_system,
+        })),
+      });
+    } catch (error) {
+      console.error("Weekly audit fetch error:", error);
+      return res.status(500).json({
+        error: "Failed to fetch weekly prelease audit",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  app.get("/api/properties/:id/concession-history", async (req, res) => {
+    try {
+      const rows = await pgRows<any>(
+        `SELECT snapshot_date, promo_count, avg_rent, source_system, created_at, updated_at
+         FROM concession_history
+         WHERE property_id = $1
+         ORDER BY snapshot_date ASC`,
+        [req.params.id]
+      );
+      return res.json(rows.map((r) => ({
+        date: r.snapshot_date,
+        promoCount: Number(r.promo_count || 0),
+        avgRent: Number(r.avg_rent || 0),
+        sourceSystem: r.source_system,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      })));
+    } catch (error) {
+      console.error("Concession history fetch error:", error);
+      return res.status(500).json({
+        error: "Failed to fetch concession history",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  app.post("/api/properties/:id/concession-history", async (req, res) => {
+    try {
+      const propertyId = req.params.id;
+      const { date, promoCount, avgRent, sourceSystem, notes } = req.body as {
+        date?: string;
+        promoCount?: number;
+        avgRent?: number;
+        sourceSystem?: string;
+        notes?: string;
+      };
+
+      const snapshotDate = String(date || "").trim();
+      if (!parseISODate(snapshotDate)) {
+        return res.status(400).json({ error: "Invalid date", message: "date must be YYYY-MM-DD" });
+      }
+
+      const count = Number(promoCount);
+      if (!Number.isFinite(count) || count < 0) {
+        return res.status(400).json({ error: "Invalid promoCount", message: "promoCount must be a non-negative number" });
+      }
+
+      const avg = Number.isFinite(Number(avgRent)) ? Number(avgRent) : 0;
+      const id = randomUUID();
+      const source = String(sourceSystem || "market_scan").slice(0, 64);
+      const note = typeof notes === "string" ? notes.slice(0, 2000) : null;
+
+      await pgRows(
+        `INSERT INTO concession_history (
+           id, property_id, snapshot_date, promo_count, avg_rent, source_system, notes
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT(property_id, snapshot_date) DO UPDATE SET
+           promo_count = EXCLUDED.promo_count,
+           avg_rent = EXCLUDED.avg_rent,
+           source_system = EXCLUDED.source_system,
+           notes = EXCLUDED.notes,
+           updated_at = CURRENT_TIMESTAMP`,
+        [id, propertyId, snapshotDate, count, avg, source, note]
+      );
+
+      const row = await pgOne<any>(
+        `SELECT snapshot_date, promo_count, avg_rent, source_system, created_at, updated_at
+         FROM concession_history
+         WHERE property_id = $1 AND snapshot_date = $2`,
+        [propertyId, snapshotDate]
+      );
+
+      return res.json({
+        date: row?.snapshot_date,
+        promoCount: Number(row?.promo_count || 0),
+        avgRent: Number(row?.avg_rent || 0),
+        sourceSystem: row?.source_system,
+        createdAt: row?.created_at,
+        updatedAt: row?.updated_at,
+      });
+    } catch (error) {
+      console.error("Concession history upsert error:", error);
+      return res.status(500).json({
+        error: "Failed to save concession history",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  app.get("/api/portfolio", async (req, res) => {
+    try {
+      const properties = await pgRows<any>("SELECT * FROM properties ORDER BY name ASC");
+      const portfolio = [];
+
+      for (const p of properties) {
+        const latestRecord = await pgOne<any>(
+          `SELECT * FROM monthly_records
+           WHERE property_id = $1
+           ORDER BY month DESC
+           LIMIT 1`,
+          [p.id]
+        );
+
+        if (!latestRecord) {
+          portfolio.push({
+            propertyId: p.id,
+            propertyName: p.name,
+            month: "No Data",
+            revenue: 0,
+            noi: 0,
+            occupancy: 0,
+            momNoiChange: 0,
+            riskFlag: false,
+            noData: true,
+          });
+          continue;
+        }
+
+        const revenue = JSON.parse(latestRecord.revenue || "{}");
+        const expenses = JSON.parse(latestRecord.expenses || "{}");
+        const getVal = (cat: any) => {
+          if (!cat) return 0;
+          if (cat.subcategories && Array.isArray(cat.subcategories)) {
+            return cat.subcategories.reduce((sum: number, sub: any) => sum + (Number(sub.actual) || 0), 0);
+          }
+          return Number(cat.actual) || 0;
+        };
+
+        const totalRev = Number(Object.values(revenue).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+        const totalExp = Number(Object.values(expenses).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+        const noi = totalRev - totalExp;
+
+        const [year, month] = String(latestRecord.month).split("-").map(Number);
+        const priorMonthDate = new Date(year, month - 2, 1);
+        const priorMonthStr = `${priorMonthDate.getFullYear()}-${String(priorMonthDate.getMonth() + 1).padStart(2, "0")}`;
+        const priorRecord = await pgOne<any>(
+          "SELECT * FROM monthly_records WHERE property_id = $1 AND month = $2",
+          [p.id, priorMonthStr]
+        );
+
+        let momNoiChange = 0;
+        if (priorRecord) {
+          const pRev = JSON.parse(priorRecord.revenue || "{}");
+          const pExp = JSON.parse(priorRecord.expenses || "{}");
+          const pTotalRev = Number(Object.values(pRev).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+          const pTotalExp = Number(Object.values(pExp).reduce((sum: number, cat: any) => sum + getVal(cat), 0));
+          const pNoi = pTotalRev - pTotalExp;
+          momNoiChange = pNoi !== 0 ? ((noi - pNoi) / Math.abs(pNoi)) * 100 : 0;
+        }
+
+        portfolio.push({
+          propertyId: p.id,
+          propertyName: p.name,
+          month: latestRecord.month,
+          revenue: totalRev,
+          noi,
+          occupancy: latestRecord.occupancy || 0,
+          momNoiChange,
+          riskFlag: Math.abs(momNoiChange) > 5 || (latestRecord.occupancy || 0) < 90,
+        });
+      }
+      res.json(portfolio);
+    } catch (error) {
+      console.error("Portfolio fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch portfolio", message: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/sync", async (req, res) => {
+    const { properties, records, weeklyData } = req.body;
+    try {
+      await inPgTransaction(async (client) => {
+        const validPropertyIds = new Set<string>();
+
+        for (const p of properties || []) {
+          if (!p.id) continue;
+          await pgRows(
+            `INSERT INTO properties (id, external_id, name, asset_type, total_beds, market, target_occupancy, competitor_names, competitor_urls)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT(id) DO UPDATE SET
+               external_id = EXCLUDED.external_id,
+               name = EXCLUDED.name,
+               asset_type = EXCLUDED.asset_type,
+               total_beds = EXCLUDED.total_beds,
+               market = EXCLUDED.market,
+               target_occupancy = EXCLUDED.target_occupancy,
+               competitor_names = EXCLUDED.competitor_names,
+               competitor_urls = EXCLUDED.competitor_urls`,
+            [
+              p.id,
+              p.externalId || null,
+              p.name,
+              p.assetType,
+              p.totalBeds,
+              p.market,
+              p.targetOccupancy,
+              JSON.stringify(p.competitorNames || []),
+              JSON.stringify(p.competitorUrls || {}),
+            ],
+            client
+          );
+          validPropertyIds.add(p.id);
+        }
+
+        const existingProps = await pgRows<any>("SELECT id FROM properties", [], client);
+        for (const p of existingProps) validPropertyIds.add(p.id);
+
+        for (const r of records || []) {
+          if (!r.propertyId || !validPropertyIds.has(r.propertyId)) continue;
+          await pgRows(
+            `INSERT INTO monthly_records (id, property_id, month, revenue, expenses, occupancy, preleased_beds)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT(id) DO UPDATE SET
+               property_id = EXCLUDED.property_id,
+               month = EXCLUDED.month,
+               revenue = EXCLUDED.revenue,
+               expenses = EXCLUDED.expenses,
+               occupancy = EXCLUDED.occupancy,
+               preleased_beds = EXCLUDED.preleased_beds`,
+            [r.id, r.propertyId, r.month, JSON.stringify(r.revenue), JSON.stringify(r.expenses), r.occupancy, r.preleasedBeds],
+            client
+          );
+        }
+
+        for (const w of weeklyData || []) {
+          if (!w.propertyId || !validPropertyIds.has(w.propertyId)) continue;
+          const week = normalizeToMondayISO(String(w.date || ""));
+          if (!week) continue;
+
+          const propertyMeta = await pgOne<any>("SELECT total_beds FROM properties WHERE id = $1", [w.propertyId], client);
+          const totalBeds = Number(propertyMeta?.total_beds || 0);
+          const preleasedBeds = Number(w.bedsLeased || 0);
+          const preleasePct = totalBeds > 0 ? (preleasedBeds / totalBeds) * 100 : 0;
+          const dataQuality = computeQualityFlag({ totalBeds, preleasedBeds, previousPct: null, currentPct: preleasePct });
+          const snapshotId = w.id || randomUUID();
+
+          await pgRows(
+            `INSERT INTO weekly_prelease (id, property_id, date, beds_leased)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(id) DO UPDATE SET
+               property_id = EXCLUDED.property_id,
+               date = EXCLUDED.date,
+               beds_leased = EXCLUDED.beds_leased`,
+            [snapshotId, w.propertyId, week, preleasedBeds],
+            client
+          );
+
+          await pgRows(
+            `INSERT INTO weekly_prelease_snapshots (
+               id, property_id, week_ending_date, total_beds, preleased_beds, prelease_pct, source_system, source_ref, data_quality, note
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT(property_id, week_ending_date) DO UPDATE SET
+               total_beds = EXCLUDED.total_beds,
+               preleased_beds = EXCLUDED.preleased_beds,
+               prelease_pct = EXCLUDED.prelease_pct,
+               source_system = EXCLUDED.source_system,
+               source_ref = EXCLUDED.source_ref,
+               data_quality = EXCLUDED.data_quality,
+               note = EXCLUDED.note,
+               updated_at = CURRENT_TIMESTAMP`,
+            [
+              snapshotId,
+              w.propertyId,
+              week,
+              totalBeds,
+              preleasedBeds,
+              preleasePct,
+              "sync",
+              "api/sync",
+              dataQuality,
+              isMondayISO(String(w.date || "")) ? null : `Normalized from ${w.date} to ${week}`,
+            ],
+            client
+          );
+        }
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Sync error:", error);
+      res.status(500).json({ error: "Sync failed", message: error instanceof Error ? error.message : String(error) });
     }
   });
 

@@ -5,7 +5,7 @@
     "api/index.ts": {
       "includeFiles": [
         "server.ts",
-        "assetsignal.db"
+        "scripts/postgres-schema.sql"
       ]
     }
   },
